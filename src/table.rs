@@ -102,7 +102,7 @@ pub fn to_tsv(doc: &Doc, st: &TableState) -> String {
         out.push_str(doc.key_of_id(c));
     }
     if st.has_other {
-        out.push_str("\t(valor)");
+        out.push_str("\t(value)");
     }
     for (r, &item) in doc.node(Doc::ROOT).children.iter().enumerate() {
         out.push('\n');
@@ -190,7 +190,7 @@ pub fn ui(
         let output = tb
             .header(row_h, |mut h| {
                 h.col(|ui| {
-                    ui.strong("#").on_hover_text("Índice del elemento en el arreglo de origen");
+                    ui.strong("#").on_hover_text(crate::i18n::t(set.lang, "在原数组中的下标", "Index in the source array"));
                 });
                 for &c in cols {
                     h.col(|ui| {
@@ -200,7 +200,7 @@ pub fn ui(
                 }
                 if has_other {
                     h.col(|ui| {
-                        ui.strong("(valor)").on_hover_text("Elementos que no son objetos");
+                        ui.strong(crate::i18n::t(set.lang, "(值)", "(value)")).on_hover_text(crate::i18n::t(set.lang, "非对象元素", "Non-object items"));
                     });
                 }
             })
@@ -219,7 +219,7 @@ pub fn ui(
                         let label = labels.get(r).copied().unwrap_or(r as u32).to_string();
                         if is_marked {
                             ui.label(RichText::new(icons::text(Icon::GitCompare, &label)).color(mark_color))
-                                .on_hover_text("Seleccionado para comparar");
+                                .on_hover_text(crate::i18n::t(set.lang, "已选择以便比较", "Selected for compare"));
                         } else {
                             ui.label(RichText::new(label).color(weak));
                         }
@@ -259,7 +259,7 @@ pub fn ui(
                                 });
                             }
                             (None, Some(k)) => {
-                                resp.on_hover_text(format!("Este elemento no tiene la clave «{k}»"));
+                                resp.on_hover_text(format!("{}「{k}」", crate::i18n::t(set.lang, "此元素没有键", "This item has no key")));
                             }
                             (None, None) => {}
                         }
@@ -282,7 +282,7 @@ pub fn ui(
                     }
                     resp.context_menu(|ui| {
                         if let Some(c) = st.ctx_cell {
-                            if ui.button("Copiar celda").on_hover_text("Cadenas sin comillas").clicked() {
+                            if ui.button(crate::i18n::t(set.lang, "复制单元格", "Copy cell")).on_hover_text(crate::i18n::t(set.lang, "字符串不含引号", "Strings without quotes")).clicked() {
                                 ui.ctx().copy_text(cell_text(doc, c));
                                 ui.close();
                             }

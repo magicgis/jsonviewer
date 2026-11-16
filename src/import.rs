@@ -4,6 +4,7 @@
 use eframe::egui::{self, Id, Key, RichText};
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::{self, Lang};
 use crate::icons::{self, Icon};
 use crate::json;
 
@@ -48,7 +49,7 @@ pub fn parse_table(text: &str, header: bool) -> Option<Table> {
         lines.next();
         unique_names(&first)
     } else {
-        (1..=ncols).map(|i| format!("Columna{i}")).collect()
+        (1..=ncols).map(|i| format!("Column{i}")).collect()
     };
     let mut rows = Vec::new();
     while let Some(line) = lines.next() {
@@ -74,7 +75,7 @@ pub fn parse_table(text: &str, header: bool) -> Option<Table> {
     }
     let widest = rows.iter().map(Vec::len).max().unwrap_or(0);
     for i in cols.len()..widest {
-        cols.push(format!("Columna{}", i + 1));
+        cols.push(format!("Column{}", i + 1));
     }
     Some(Table { cols, rows })
 }
@@ -84,7 +85,7 @@ fn unique_names(names: &[&str]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(names.len());
     for (i, n) in names.iter().enumerate() {
         let base = match n.trim() {
-            "" => format!("Columna{}", i + 1),
+            "" => format!("Column{}", i + 1),
             n => n.to_string(),
         };
         let mut name = base.clone();
@@ -211,30 +212,36 @@ pub enum Action {
     Close,
 }
 
-pub fn window(ctx: &egui::Context, d: &mut Dialog, o: &mut ImportOptions, indent: &str) -> Option<Action> {
+pub fn window(ctx: &egui::Context, d: &mut Dialog, o: &mut ImportOptions, indent: &str, lang: Lang) -> Option<Action> {
     let mut action = None;
     let mut open = true;
-    egui::Window::new("Importar tabla de SQL Server")
+    egui::Window::new(i18n::t(lang, "导入 SQL Server 表", "Import SQL Server table"))
         .id(Id::new("import_window"))
         .open(&mut open)
         .default_size([820.0, 460.0])
         .resizable(true)
         .collapsible(false)
         .show(ctx, |ui| {
-            ui.label("Pega aquí el resultado de «Copy with Headers» (Ctrl+Mayús+C) de SQL Server Management Studio.");
+            ui.label(i18n::t(
+                lang,
+                "在此粘贴 SQL Server Management Studio 的「Copy with Headers」(Ctrl+Shift+C) 结果。",
+                "Paste here the result of “Copy with Headers” (Ctrl+Shift+C) from SQL Server Management Studio.",
+            ));
             ui.label(
-                RichText::new(
-                    "Columnas separadas por tabulador, una fila por línea. Cada fila se convierte en un objeto.",
-                )
+                RichText::new(i18n::t(
+                    lang,
+                    "列以制表符分隔，每行一条记录。每行会转换成一个对象。",
+                    "Tab-separated columns, one row per line. Each row becomes an object.",
+                ))
                 .weak(),
             );
             ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut o.header, "Primera fila con encabezados");
+                ui.checkbox(&mut o.header, i18n::t(lang, "第一行是表头", "First row has headers"));
                 ui.checkbox(&mut o.nulls, "NULL → null");
-                ui.checkbox(&mut o.numbers, "Detectar números")
-                    .on_hover_text("Los valores con forma de número se escriben sin comillas; 001 queda como texto");
-                ui.checkbox(&mut o.single_object, "Una sola fila como objeto")
-                    .on_hover_text("Si la tabla tiene una sola fila, genera un objeto en lugar de un arreglo");
+                ui.checkbox(&mut o.numbers, i18n::t(lang, "识别数字", "Detect numbers"))
+                    .on_hover_text(i18n::t(lang, "形如数字的值不加引号；001 仍为文本", "Number-like values are written without quotes; 001 stays text"));
+                ui.checkbox(&mut o.single_object, i18n::t(lang, "单行输出为对象", "Single row as object"))
+                    .on_hover_text(i18n::t(lang, "若只有一行，生成对象而不是数组", "If there is only one row, emit an object instead of an array"));
             });
             ui.add_space(4.0);
 
@@ -271,29 +278,35 @@ pub fn window(ctx: &egui::Context, d: &mut Dialog, o: &mut ImportOptions, indent
             ui.horizontal(|ui| {
                 match d.summary {
                     Some((rows, cols, irregular)) => {
-                        let f = if rows == 1 { "fila" } else { "filas" };
-                        ui.label(format!("{rows} {f} × {cols} columnas"));
+                        ui.label(format!(
+                            "{rows} {} × {cols} {}",
+                            i18n::t(lang, "行", "rows"),
+                            i18n::t(lang, "列", "columns")
+                        ));
                         if irregular > 0 {
                             ui.label(
-                                RichText::new(format!("· {irregular} con un número distinto de columnas"))
-                                    .color(ui.visuals().warn_fg_color),
+                                RichText::new(format!(
+                                    "· {irregular} {}",
+                                    i18n::t(lang, "行列数不一致", "with a different column count")
+                                ))
+                                .color(ui.visuals().warn_fg_color),
                             );
                         }
                     }
                     None => {
-                        ui.label(RichText::new("Sin datos").weak());
+                        ui.label(RichText::new(i18n::t(lang, "无数据", "No data")).weak());
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(icons::text(Icon::X, "Cancelar")).clicked() {
+                    if ui.button(icons::text(Icon::X, i18n::t(lang, "取消", "Cancel"))).clicked() {
                         action = Some(Action::Close);
                     }
                     let ok = d.summary.is_some_and(|(rows, _, _)| rows > 0);
                     let convert = ui
-                        .add_enabled(ok, egui::Button::new(icons::text(Icon::Check, "Convertir a JSON")))
+                        .add_enabled(ok, egui::Button::new(icons::text(Icon::Check, i18n::t(lang, "转换为 JSON", "Convert to JSON"))))
                         .on_hover_text("Ctrl+Enter");
                     if ui
-                        .add_enabled(!d.text.is_empty(), egui::Button::new(icons::text(Icon::Eraser, "Limpiar")))
+                        .add_enabled(!d.text.is_empty(), egui::Button::new(icons::text(Icon::Eraser, i18n::t(lang, "清空", "Clear"))))
                         .clicked()
                     {
                         d.text.clear();
@@ -343,14 +356,14 @@ mod tests {
         let o = ImportOptions { nulls: false, numbers: false, single_object: true, ..Default::default() };
         assert_eq!(to_json(&t, &o, "  "), "{\n  \"A\": \"NULL\",\n  \"B\": \"5\"\n}\n");
         let t = parse_table("x\ty\n", false).unwrap();
-        assert_eq!(t.cols, ["Columna1", "Columna2"]);
+        assert_eq!(t.cols, ["Column1", "Column2"]);
         assert_eq!(t.rows, [["x", "y"]]);
     }
 
     #[test]
     fn multiline_values_and_names() {
         let t = parse_table("Code\tCode\t\tC\n1\tuno\ndos\t2\t3\n4\t5\t6\t7\n", true).unwrap();
-        assert_eq!(t.cols, ["Code", "Code_2", "Columna3", "C"]);
+        assert_eq!(t.cols, ["Code", "Code_2", "Column3", "C"]);
         assert_eq!(t.rows, [vec!["1", "uno\ndos", "2", "3"], vec!["4", "5", "6", "7"]]);
     }
 

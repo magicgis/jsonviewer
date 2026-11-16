@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::Lang;
 use crate::import::ImportOptions;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -45,6 +46,8 @@ pub enum InitialFold {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// 界面语言；缺省 / 旧配置无此字段时为中文。
+    pub lang: Lang,
     pub dark: bool,
     pub font_size: f32,
     pub ui_scale: f32,
@@ -85,6 +88,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            lang: Lang::Zh,
             dark: true,
             font_size: 13.5,
             ui_scale: 1.0,

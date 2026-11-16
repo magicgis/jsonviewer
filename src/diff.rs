@@ -418,9 +418,8 @@ impl DiffView {
 
     pub fn position_label(&self) -> String {
         match self.current {
-            Some(c) => format!("{} de {}", c + 1, self.shown_hunks.len()),
-            None if self.shown_hunks.len() == 1 => "1 diferencia".to_string(),
-            None => format!("{} diferencias", self.shown_hunks.len()),
+            Some(c) => format!("{}/{}", c + 1, self.shown_hunks.len()),
+            None => self.shown_hunks.len().to_string(),
         }
     }
 }
@@ -463,6 +462,7 @@ pub fn show(
     only_changes: bool,
     pal: &Palette,
     query: &str,
+    lang: crate::i18n::Lang,
 ) {
     st.ensure(d, only_changes);
     if !only_changes {
@@ -541,7 +541,12 @@ pub fn show(
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
-                            format!("⋯ {} líneas iguales (doble clic para mostrar todo)", row.left),
+                            format!(
+                                "⋯ {} {} ({})",
+                                row.left,
+                                crate::i18n::t(lang, "行相同", "equal lines"),
+                                crate::i18n::t(lang, "双击显示全部", "double-click to show all"),
+                            ),
                             font.clone(),
                             col.num,
                         );
@@ -671,10 +676,22 @@ pub fn show(
 }
 
 /// Lista de cambios por ruta; clic en uno lo muestra en la comparación.
-pub fn changes_list(ui: &mut Ui, d: &Diff, st: &mut DiffView) {
+pub fn changes_list(ui: &mut Ui, d: &Diff, st: &mut DiffView, lang: crate::i18n::Lang) {
     let more = if d.changes_truncated { "+" } else { "" };
-    ui.strong(format!("Cambios por ruta ({}{more})", d.changes.len()));
-    ui.label(RichText::new("Objetos por clave, arreglos por posición.").weak().small());
+    ui.strong(format!(
+        "{} ({}{more})",
+        crate::i18n::t(lang, "按路径的变更", "Changes by path"),
+        d.changes.len()
+    ));
+    ui.label(
+        RichText::new(crate::i18n::t(
+            lang,
+            "对象按键名，数组按位置。",
+            "Objects by key, arrays by position.",
+        ))
+        .weak()
+        .small(),
+    );
     ui.add_space(4.0);
     let col = Colors::new(ui.visuals().dark_mode, ui);
     let font = TextStyle::Monospace.resolve(ui.style());
@@ -686,9 +703,17 @@ pub fn changes_list(ui: &mut Ui, d: &Diff, st: &mut DiffView) {
         |ui, range| {
             for c in &d.changes[range] {
                 let (sym, color, what) = match c.kind {
-                    ChangeKind::Changed => ("~ ", col.current, "Modificado"),
-                    ChangeKind::Removed => ("− ", col.del_text.gamma_multiply(1.8), "Solo a la izquierda"),
-                    ChangeKind::Added => ("+ ", col.add_text.gamma_multiply(1.8), "Solo a la derecha"),
+                    ChangeKind::Changed => ("~ ", col.current, crate::i18n::t(lang, "已修改", "Modified")),
+                    ChangeKind::Removed => (
+                        "− ",
+                        col.del_text.gamma_multiply(1.8),
+                        crate::i18n::t(lang, "仅左侧", "Only on the left"),
+                    ),
+                    ChangeKind::Added => (
+                        "+ ",
+                        col.add_text.gamma_multiply(1.8),
+                        crate::i18n::t(lang, "仅右侧", "Only on the right"),
+                    ),
                 };
                 let mut job = egui::text::LayoutJob::default();
                 let fmt = |color| egui::TextFormat { font_id: font.clone(), color, ..Default::default() };

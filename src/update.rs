@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eframe::egui::Context;
 use sha2::{Digest, Sha256};
 
+use crate::i18n::{self, Lang};
 use crate::json::{self, Doc, Kind, NodeId};
 
 const API_LATEST: &str = "https://api.github.com/repos/iscalexsoto/jsonviewer/releases/latest";
@@ -117,15 +118,15 @@ impl Updater {
 
     /// Comprobación automática al iniciar: solo si está activada y pasó el intervalo.
     /// Devuelve `true` si se lanzó (para guardar la fecha en los ajustes).
-    pub fn check_on_start(&mut self, ctx: &Context, enabled: bool, last_check: u64) -> bool {
+    pub fn check_on_start(&mut self, ctx: &Context, enabled: bool, last_check: u64, lang: Lang) -> bool {
         if !enabled || now().saturating_sub(last_check) < CHECK_INTERVAL {
             return false;
         }
-        self.check(ctx, false);
+        self.check(ctx, false, lang);
         true
     }
 
-    pub fn check(&mut self, ctx: &Context, manual: bool) {
+    pub fn check(&mut self, ctx: &Context, manual: bool, lang: Lang) {
         if self.busy() {
             self.manual |= manual;
             return;
@@ -136,13 +137,13 @@ impl Updater {
         self.rx = Some(rx);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let r = fetch_latest().map(|rel| rel.filter(|r| newer(&r.version, CURRENT)));
+            let r = fetch_latest(lang).map(|rel| rel.filter(|r| newer(&r.version, CURRENT)));
             let _ = tx.send(Msg::Checked(r));
             ctx.request_repaint();
         });
     }
 
-    pub fn download(&mut self, ctx: &Context) {
+    pub fn download(&mut self, ctx: &Context, lang: Lang) {
         let Status::Available(rel) = &self.status else { return };
         if self.busy() {
             return;
@@ -153,7 +154,7 @@ impl Updater {
         self.rx = Some(rx);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let r = install(&rel, &tx, &ctx);
+            let r = install(&rel, &tx, &ctx, lang);
             let _ = tx.send(Msg::Done(r));
             ctx.request_repaint();
         });
@@ -230,7 +231,7 @@ impl Updater {
         std::process::Command::new(&exe)
             .args(files)
             .spawn()
-            .map_err(|e| format!("No se pudo iniciar {}: {e}", exe.display()))?;
+            .map_err(|e| format!("Failed to start {}: {e}", exe.display()))?;
         self.restarting = true;
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
         Ok(())
@@ -281,32 +282,44 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-fn net_err(e: ureq::Error) -> String {
+fn net_err(lang: Lang, e: ureq::Error) -> String {
     match e {
-        ureq::Error::StatusCode(403 | 429) => {
-            "GitHub limitó las consultas desde esta red; prueba en unos minutos.".into()
+        ureq::Error::StatusCode(403 | 429) => i18n::t(
+            lang,
+            "GitHub 限制了此网络的请求，请稍后再试。",
+            "GitHub rate-limited this network; try again in a few minutes.",
+        )
+        .into(),
+        ureq::Error::StatusCode(404) => i18n::t(lang, "尚未发布任何版本。", "No release has been published.").into(),
+        ureq::Error::StatusCode(code) => format!(
+            "{} {code}.",
+            i18n::t(lang, "GitHub 返回状态码", "GitHub responded with status")
+        ),
+        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => {
+            i18n::t(lang, "无法连接 GitHub。", "No connection to GitHub.").into()
         }
-        ureq::Error::StatusCode(404) => "No hay ninguna release publicada.".into(),
-        ureq::Error::StatusCode(code) => format!("GitHub respondió con el código {code}."),
-        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => "Sin conexión con GitHub.".into(),
-        ureq::Error::Timeout(_) => "GitHub tardó demasiado en responder.".into(),
-        ureq::Error::Io(e) => format!("Error de red: {e}"),
-        e => format!("No se pudo conectar: {e}"),
+        ureq::Error::Timeout(_) => i18n::t(lang, "GitHub 响应超时。", "GitHub took too long to respond.").into(),
+        ureq::Error::Io(e) => format!("{}: {e}", i18n::t(lang, "网络错误", "Network error")),
+        e => format!("{}: {e}", i18n::t(lang, "无法连接", "Could not connect")),
     }
 }
 
 /// Lee la última release. `None` si no tiene un asset `-x64.exe`.
-fn fetch_latest() -> Result<Option<Release>, String> {
+fn fetch_latest(lang: Lang) -> Result<Option<Release>, String> {
     let agent = agent();
     let mut resp = agent
         .get(API_LATEST)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .call()
-        .map_err(net_err)?;
-    let body = resp.body_mut().read_to_string().map_err(net_err)?;
-    let doc = json::parse(&body).map_err(|e| format!("Respuesta de GitHub no válida: {e}"))?;
-    let Some(rel) = parse_release(&doc).ok_or("La respuesta de GitHub no tiene el formato esperado.")? else {
+        .map_err(|e| net_err(lang, e))?;
+    let body = resp.body_mut().read_to_string().map_err(|e| net_err(lang, e))?;
+    let doc = json::parse(&body).map_err(|e| {
+        format!("{}: {e}", i18n::t(lang, "GitHub 响应无效", "Invalid GitHub response"))
+    })?;
+    let Some(rel) = parse_release(&doc)
+        .ok_or_else(|| i18n::t(lang, "GitHub 响应格式不符合预期。", "Unexpected GitHub response format.").to_string())?
+    else {
         return Ok(None);
     };
     // Si no hay digest, busca un asset .sha256 y léelo.
@@ -395,27 +408,51 @@ fn old_exe_path(exe: &Path) -> Option<PathBuf> {
 ///
 /// `Err((motivo, Some(ruta)))`: el ejecutable nuevo quedó en `ruta` pero no se pudo
 /// reemplazar el actual. `Err((motivo, None))`: no quedó nada utilizable.
-fn install(rel: &Release, tx: &Sender<Msg>, ctx: &Context) -> Result<PathBuf, (String, Option<PathBuf>)> {
-    let exe = std::env::current_exe().map_err(|e| (format!("No se encontró el ejecutable actual: {e}"), None))?;
-    let dir = exe.parent().ok_or_else(|| ("El ejecutable no tiene carpeta.".to_string(), None))?;
+fn install(
+    rel: &Release,
+    tx: &Sender<Msg>,
+    ctx: &Context,
+    lang: Lang,
+) -> Result<PathBuf, (String, Option<PathBuf>)> {
+    let exe = std::env::current_exe().map_err(|e| {
+        (
+            format!("{}: {e}", i18n::t(lang, "找不到当前可执行文件", "Current executable not found")),
+            None,
+        )
+    })?;
+    let dir = exe.parent().ok_or_else(|| {
+        (i18n::t(lang, "可执行文件没有所在目录。", "Executable has no parent folder.").to_string(), None)
+    })?;
     let part = dir.join(format!("{}.part", rel.asset_name));
 
-    let r = download(rel, &part, tx, ctx);
+    let r = download(rel, &part, tx, ctx, lang);
     if let Err(e) = r {
         let _ = fs::remove_file(&part);
         return Err((e, None));
     }
 
     // Renombrar el actual a .old.exe (Windows permite renombrar un exe en ejecución).
-    let old = old_exe_path(&exe).ok_or_else(|| ("Nombre de ejecutable no válido.".to_string(), None))?;
+    let old = old_exe_path(&exe).ok_or_else(|| {
+        (i18n::t(lang, "可执行文件名无效。", "Invalid executable name.").to_string(), None)
+    })?;
     let _ = fs::remove_file(&old);
     if let Err(e) = fs::rename(&exe, &old) {
-        return Err(keep_aside(&part, dir, &rel.asset_name, format!("No se pudo apartar el ejecutable actual: {e}")));
+        return Err(keep_aside(
+            &part,
+            dir,
+            &rel.asset_name,
+            format!("{}: {e}", i18n::t(lang, "无法挪开当前可执行文件", "Could not move the current executable aside")),
+        ));
     }
     if let Err(e) = fs::rename(&part, &exe) {
         // Intentar dejar todo como estaba.
         let _ = fs::rename(&old, &exe);
-        return Err(keep_aside(&part, dir, &rel.asset_name, format!("No se pudo colocar el ejecutable nuevo: {e}")));
+        return Err(keep_aside(
+            &part,
+            dir,
+            &rel.asset_name,
+            format!("{}: {e}", i18n::t(lang, "无法写入新可执行文件", "Could not put the new executable in place")),
+        ));
     }
     Ok(exe)
 }
@@ -429,21 +466,27 @@ fn keep_aside(part: &Path, dir: &Path, name: &str, reason: String) -> (String, O
     }
 }
 
-fn download(rel: &Release, dest: &Path, tx: &Sender<Msg>, ctx: &Context) -> Result<(), String> {
-    let mut resp = agent().get(&rel.asset_url).call().map_err(net_err)?;
+fn download(rel: &Release, dest: &Path, tx: &Sender<Msg>, ctx: &Context, lang: Lang) -> Result<(), String> {
+    let mut resp = agent().get(&rel.asset_url).call().map_err(|e| net_err(lang, e))?;
     let total = resp.body().content_length().unwrap_or(rel.size);
-    let mut file = fs::File::create(dest).map_err(|e| format!("No se pudo crear {}: {e}", dest.display()))?;
+    let mut file = fs::File::create(dest).map_err(|e| {
+        format!("{} {}: {e}", i18n::t(lang, "无法创建", "Could not create"), dest.display())
+    })?;
     let mut reader = resp.body_mut().as_reader();
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut received = 0u64;
     let mut last_report = 0u64;
     loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("Se interrumpió la descarga: {e}"))?;
+        let n = reader.read(&mut buf).map_err(|e| {
+            format!("{}: {e}", i18n::t(lang, "下载中断", "Download interrupted"))
+        })?;
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n]).map_err(|e| format!("No se pudo escribir el archivo: {e}"))?;
+        file.write_all(&buf[..n]).map_err(|e| {
+            format!("{}: {e}", i18n::t(lang, "无法写入文件", "Could not write the file"))
+        })?;
         hasher.update(&buf[..n]);
         received += n as u64;
         if received - last_report >= 256 * 1024 {
@@ -455,26 +498,49 @@ fn download(rel: &Release, dest: &Path, tx: &Sender<Msg>, ctx: &Context) -> Resu
     file.flush().map_err(|e| e.to_string())?;
     drop(file);
     if received == 0 {
-        return Err("La descarga llegó vacía.".into());
+        return Err(i18n::t(lang, "下载内容为空。", "Download was empty.").into());
     }
     if total > 0 && received != total {
-        return Err(format!("Descarga incompleta ({received} de {total} bytes)."));
+        return Err(format!(
+            "{} ({received} / {total} bytes).",
+            i18n::t(lang, "下载不完整", "Incomplete download")
+        ));
     }
     if let Some((want, _)) = &rel.sha256 {
         let got = format!("{:x}", hasher.finalize());
         if &got != want {
-            return Err("El archivo descargado no coincide con el SHA-256 publicado.".into());
+            return Err(i18n::t(
+                lang,
+                "下载的文件与公布的 SHA-256 不一致。",
+                "Downloaded file does not match the published SHA-256.",
+            )
+            .into());
         }
     }
     Ok(())
 }
 
 /// Texto del tooltip sobre la verificación del archivo.
-pub fn sha_note(rel: &Release) -> String {
+pub fn sha_note(rel: &Release, lang: Lang) -> String {
     match &rel.sha256 {
-        Some((_, ShaSource::Digest)) => "Se verificará el SHA-256 que publica GitHub para el archivo.".into(),
-        Some((_, ShaSource::Asset)) => "Se verificará el SHA-256 del archivo .sha256 de la release.".into(),
-        None => "La release no publica SHA-256; el archivo no se verificará.".into(),
+        Some((_, ShaSource::Digest)) => i18n::t(
+            lang,
+            "将校验 GitHub 为该文件公布的 SHA-256。",
+            "The SHA-256 published by GitHub for the file will be verified.",
+        )
+        .into(),
+        Some((_, ShaSource::Asset)) => i18n::t(
+            lang,
+            "将校验 release 中 .sha256 文件提供的哈希。",
+            "The SHA-256 from the release’s .sha256 asset will be verified.",
+        )
+        .into(),
+        None => i18n::t(
+            lang,
+            "此 release 未公布 SHA-256，将不做校验。",
+            "This release publishes no SHA-256; the file will not be verified.",
+        )
+        .into(),
     }
 }
 
@@ -542,16 +608,16 @@ mod tests {
     #[test]
     #[ignore]
     fn real_release_and_download() {
-        let rel = fetch_latest().expect("consulta a GitHub").expect("asset -x64.exe");
+        let rel = fetch_latest(Lang::En).expect("GitHub query").expect("asset -x64.exe");
         assert!(parse_version(&rel.version).is_some(), "tag {}", rel.version);
         assert!(rel.asset_name.ends_with(ASSET_SUFFIX));
         assert!(rel.notes_url.starts_with("https://github.com/iscalexsoto/jsonviewer/releases/"));
-        assert!(rel.sha256.is_some(), "GitHub publica digest para los assets");
+        assert!(rel.sha256.is_some(), "GitHub publishes digests for assets");
         let dir = std::env::temp_dir().join("jsonviewer-update-test");
         fs::create_dir_all(&dir).unwrap();
         let dest = dir.join(&rel.asset_name);
         let (tx, rx) = mpsc::channel();
-        download(&rel, &dest, &tx, &Context::default()).expect("descarga y SHA-256");
+        download(&rel, &dest, &tx, &Context::default(), Lang::En).expect("download and SHA-256");
         assert_eq!(fs::metadata(&dest).unwrap().len(), rel.size);
         assert!(rx.try_iter().any(|m| matches!(m, Msg::Progress { .. })));
         fs::remove_dir_all(&dir).unwrap();

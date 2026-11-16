@@ -1,22 +1,8 @@
-//! Íconos Lucide como glifos de texto (la fuente va incrustada en el ejecutable) y
-//! botones de ícono con su nombre en el tooltip.
+//! Lucide icons as text glyphs (font is registered via `add_font` at app startup)
+//! and icon buttons with tooltips.
 
-use std::sync::Arc;
-
-use eframe::egui::{self, Button, FontData, FontDefinitions, FontFamily, Response, RichText, TextStyle, Ui, Vec2};
+use eframe::egui::{self, Button, Response, RichText, TextStyle, Ui, Vec2};
 pub use lucide_icons::Icon;
-
-const FONT: &str = "lucide";
-
-/// Registra la fuente Lucide justo después de la fuente principal de cada familia,
-/// así cualquier texto puede incluir un ícono.
-pub fn install(fonts: &mut FontDefinitions) {
-    fonts.font_data.insert(FONT.into(), Arc::new(FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES)));
-    for fam in [FontFamily::Proportional, FontFamily::Monospace] {
-        let list = fonts.families.entry(fam).or_default();
-        list.insert(1.min(list.len()), FONT.into());
-    }
-}
 
 /// Texto con el ícono delante, para menús y botones con etiqueta.
 pub fn text(icon: Icon, label: &str) -> String {

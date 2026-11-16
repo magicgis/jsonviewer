@@ -4,6 +4,7 @@ mod app;
 mod common;
 mod diff;
 mod highlight;
+mod i18n;
 mod icons;
 mod import;
 mod json;
@@ -14,19 +15,39 @@ mod tree;
 mod update;
 
 fn main() -> eframe::Result {
-    update::Updater::cleanup();
+    // 启动计时日志：%TEMP%\jsonviewer-startup.log
+    let _ = std::fs::write(std::env::temp_dir().join("jsonviewer-startup.log"), "startup\n");
+    app::startup_log_pub("main begin");
+
+    // 清理旧 exe 不阻塞窗口创建。
+    std::thread::spawn(|| update::Updater::cleanup());
+
+    // 与 GL 初始化并行读系统字体。
+    let font_rx = app::spawn_system_font_loader();
+    app::startup_log_pub("font thread started");
+
     let files: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
+    app::startup_log_pub("args parsed");
+
+    // 不在启动时解码大图标；app_id 用 ASCII，避免漫游目录乱码。
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Visor JSON")
+            .with_app_id("jsonviewer")
+            .with_title("JSON 查看器")
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([480.0, 320.0])
             .with_drag_and_drop(true)
-            .with_icon(
-                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png"))
-                    .expect("el ícono incrustado debe ser un PNG válido"),
-            ),
+            .with_icon(eframe::egui::IconData::default()),
+        persist_window: true,
         ..Default::default()
     };
-    eframe::run_native("Visor JSON", options, Box::new(|cc| Ok(Box::new(app::App::new(cc, files)))))
+    app::startup_log_pub("before run_native");
+    eframe::run_native(
+        "JSON 查看器",
+        options,
+        Box::new(move |cc| {
+            app::startup_log_pub("creation callback");
+            Ok(Box::new(app::App::new(cc, files, font_rx)))
+        }),
+    )
 }

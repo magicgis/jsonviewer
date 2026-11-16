@@ -388,10 +388,10 @@ fn line_job(
     if set.show_counts && line.kind == LineKind::Closed {
         let c = n.children.len();
         let what = match (is_obj, c == 1) {
-            (true, true) => "propiedad",
-            (true, false) => "propiedades",
-            (false, true) => "elemento",
-            (false, false) => "elementos",
+            (true, true) => crate::i18n::t(set.lang, "个属性", "property"),
+            (true, false) => crate::i18n::t(set.lang, "个属性", "properties"),
+            (false, true) => crate::i18n::t(set.lang, "项", "item"),
+            (false, false) => crate::i18n::t(set.lang, "项", "items"),
         };
         s.colored(&format!("  // {c} {what}"), pal.faint);
     }
@@ -409,10 +409,11 @@ fn context_menu(
 ) -> Option<Out> {
     let n = doc.node(id);
     let mut out = None;
-    if let Some((label, table)) = common::table_choice(doc, id, multi) {
+    let lang = set.lang;
+    if let Some((label, table)) = common::table_choice(doc, id, multi, lang) {
         if ui
             .add(egui::Button::new(crate::icons::text(crate::icons::Icon::Table, &label)).shortcut_text("G"))
-            .on_hover_text("Abre una pestaña con una columna por clave y una fila por elemento")
+            .on_hover_text(crate::i18n::t(lang, "打开标签页：每键一列、每元素一行", "Open a tab with one column per key and one row per item"))
             .clicked()
         {
             out = Some(table);
@@ -427,16 +428,16 @@ fn context_menu(
                 ui.close();
             }
         };
-        item(ui, "Expandir", "→", Action::Expand);
-        item(ui, "Cerrar", "←", Action::Close);
-        item(ui, "Compactar (una línea)", "C", Action::Compact);
+        item(ui, crate::i18n::t(lang, "展开", "Expand"), "→", Action::Expand);
+        item(ui, crate::i18n::t(lang, "折叠", "Collapse"), "←", Action::Close);
+        item(ui, crate::i18n::t(lang, "压缩（单行）", "Compact (one line)"), "C", Action::Compact);
         ui.separator();
-        item(ui, "Compactar hijos", "H", Action::CompactChildren);
-        item(ui, "Cerrar hijos", "X", Action::CloseChildren);
-        item(ui, "Expandir todo el subárbol", "E", Action::ExpandAll);
-        item(ui, "Auto-compactar subárbol", "A", Action::Auto);
+        item(ui, crate::i18n::t(lang, "压缩子节点", "Compact children"), "H", Action::CompactChildren);
+        item(ui, crate::i18n::t(lang, "折叠子节点", "Close children"), "X", Action::CloseChildren);
+        item(ui, crate::i18n::t(lang, "展开整个子树", "Expand entire subtree"), "E", Action::ExpandAll);
+        item(ui, crate::i18n::t(lang, "自动压缩子树", "Auto-compact subtree"), "A", Action::Auto);
         ui.separator();
-        item(ui, "Aplicar este estado a nodos similares", "", Action::ApplySimilar);
+        item(ui, crate::i18n::t(lang, "将此状态应用到相似节点", "Apply this state to similar nodes"), "", Action::ApplySimilar);
         ui.separator();
     }
     common::node_menu(ui, doc, id, set, mark).or(out)
@@ -455,7 +456,7 @@ pub fn ui(
 ) -> Option<Out> {
     let key_out = if keys {
         st.handle_keys(ui, doc, set);
-        common::table_key(ui, doc, st.selected, &st.multi)
+        common::table_key(ui, doc, st.selected, &st.multi, set.lang)
     } else {
         None
     };
@@ -587,9 +588,11 @@ pub fn ui(
                 act = Some((line.node, Action::Toggle));
             }
             if foldable && on_arrow {
-                resp.clone().on_hover_text_at_pointer(
-                    "Clic: expandir/cerrar · Ctrl+clic: compactar · Alt+clic: compactar hijos · Mayús+clic: expandir todo",
-                );
+                resp.clone().on_hover_text_at_pointer(crate::i18n::t(
+                    set.lang,
+                    "单击：展开/折叠 · Ctrl+单击：压缩 · Alt+单击：压缩子节点 · Shift+单击：全部展开",
+                    "Click: expand/collapse · Ctrl+click: compact · Alt+click: compact children · Shift+click: expand all",
+                ));
             }
             resp.context_menu(|ui| {
                 if let Some(o) = context_menu(ui, doc, line.node, set, mark, multi, &mut act) {

@@ -1,10 +1,11 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id, Key, KeyboardShortcut,
-    Modifiers, Rect, RichText, Sense, Stroke, StrokeKind, TextStyle, Ui, Vec2, pos2,
+    self, Align2, Color32, CornerRadius, FontData, FontFamily, FontId, Id, Key, KeyboardShortcut, Modifiers, Rect,
+    RichText, Sense, Stroke, StrokeKind, TextStyle, Ui, Vec2, pos2,
+    epaint::text::{FontInsert, FontPriority, InsertFontFamily},
     text::{CCursor, CCursorRange},
     text_edit::TextEditState,
     vec2,
@@ -13,6 +14,7 @@ use eframe::egui::{
 use crate::common::{Mark, Out};
 use crate::diff::{self, Diff, DiffView};
 use crate::highlight::{self, Palette};
+use crate::i18n::{self, Lang};
 use crate::icons::{self, Icon};
 use crate::import;
 use crate::json::{self, Doc, Layout, NONE, NodeId, ParseError};
@@ -300,7 +302,7 @@ impl DocTab {
             .chars()
             .map(|c| if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
             .collect();
-        let name = if name.is_empty() { "documento".into() } else { name };
+        let name = if name.is_empty() { "document".into() } else { name };
         if std::path::Path::new(&name).extension().is_some() { name } else { format!("{name}.json") }
     }
 
@@ -318,7 +320,7 @@ impl DocTab {
             return;
         }
         let t0 = Instant::now();
-        match json::parse(&self.source) {
+        match json::parse_with(&self.source, set.lang) {
             Ok(doc) => {
                 let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 self.loaded = Some(Loaded::new(doc, set, parse_ms));
@@ -339,7 +341,7 @@ pub struct App {
     next_uid: u64,
     paste_n: usize,
     table_n: usize,
-    /// Ventana «Importar tabla de SQL Server».
+    /// SQL Server 表导入对话框。
     import: Option<import::Dialog>,
     search: String,
     focus_search: bool,
@@ -356,6 +358,21 @@ pub struct App {
     /// Elemento marcado con «Seleccionar para comparar».
     mark: Option<CompareMark>,
     updater: Updater,
+    /// 后台加载的系统字体（拉丁 + CJK），用 add_font 安装，避免启动时 set_fonts。
+    font_rx: Option<std::sync::mpsc::Receiver<Vec<FontInsert>>>,
+    /// 已应用的窗口标题语言，避免每帧重复设置。
+    title_lang: Option<Lang>,
+    /// 启动阶段：eframe 在首帧渲染前窗口不可见，故把重活拆到首帧之后。
+    boot: Boot,
+}
+
+/// 启动两阶段：先画出空窗口，再打开命令行传入的文件。
+enum Boot {
+    /// 尚未完成首帧；`files` 为待打开路径。
+    FirstPaint { files: Vec<PathBuf> },
+    /// 首帧已过，下一帧打开文件。
+    OpenFiles { files: Vec<PathBuf> },
+    Done,
 }
 
 /// Pestaña cuyo nombre se está editando.
@@ -367,10 +384,35 @@ struct Rename {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        files: Vec<PathBuf>,
+        font_rx: std::sync::mpsc::Receiver<Vec<FontInsert>>,
+    ) -> Self {
+        startup_log("App::new begin");
+        // 仅读设置；打开文件 / 检查更新 / Lucide 都延后——eframe 在首帧前窗口是隐藏的。
         let set: Settings = cc.storage.and_then(|s| eframe::get_value(s, SETTINGS_KEY)).unwrap_or_default();
-        setup_fonts(&cc.egui_ctx);
-        let mut app = Self {
+        startup_log("settings loaded");
+
+        // 字体线程在 main 里与 GL 并行启动；若已完成则立刻安装（已去掉内置 default_fonts）。
+        let mut pending_fonts = Some(font_rx);
+        if let Some(rx) = pending_fonts.take() {
+            match rx.try_recv() {
+                Ok(fonts) => {
+                    install_font_inserts(&cc.egui_ctx, fonts);
+                    startup_log("system fonts ready in App::new");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    pending_fonts = Some(rx);
+                    startup_log("system fonts still loading");
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    startup_log("system fonts channel closed");
+                }
+            }
+        }
+
+        let app = Self {
             pal: if set.dark { Palette::dark() } else { Palette::light() },
             set,
             tabs: Vec::new(),
@@ -390,29 +432,95 @@ impl App {
             filter_gen: 1,
             mark: None,
             updater: Updater::default(),
+            font_rx: pending_fonts,
+            title_lang: None,
+            boot: Boot::FirstPaint { files },
         };
-        for f in files {
-            app.open_path(f);
-        }
-        if app.updater.check_on_start(&cc.egui_ctx, app.set.check_updates, app.set.last_update_check) {
-            app.set.last_update_check = update::timestamp();
-        }
+        startup_log("App::new end");
         app
+    }
+
+    fn t(&self, zh: &'static str, en: &'static str) -> &'static str {
+        i18n::t(self.set.lang, zh, en)
     }
 
     fn notify(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    /// 启动阶段：首帧尽快结束（窗口才能显示），下一帧再打开文件。
+    fn boot_step(&mut self, ctx: &egui::Context) {
+        match std::mem::replace(&mut self.boot, Boot::Done) {
+            Boot::FirstPaint { files } => {
+                startup_log("first paint — queue lucide");
+                install_lucide(ctx);
+                self.boot = Boot::OpenFiles { files };
+                ctx.request_repaint();
+            }
+            Boot::OpenFiles { files } => {
+                startup_log("opening files");
+                for f in files {
+                    self.open_path(f);
+                }
+                if self.updater.check_on_start(
+                    ctx,
+                    self.set.check_updates,
+                    self.set.last_update_check,
+                    self.set.lang,
+                ) {
+                    self.set.last_update_check = update::timestamp();
+                }
+                startup_log("boot done");
+                self.boot = Boot::Done;
+            }
+            Boot::Done => {}
+        }
+    }
+
+    /// 收取后台系统字体并用 add_font 安装（不重建整套字体）。
+    fn poll_fonts(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.font_rx else { return };
+        let Ok(fonts) = rx.try_recv() else { return };
+        self.font_rx = None;
+        install_font_inserts(ctx, fonts);
+        ctx.request_repaint();
+    }
+
+    fn sync_title(&mut self, ctx: &egui::Context) {
+        if self.title_lang == Some(self.set.lang) {
+            return;
+        }
+        self.title_lang = Some(self.set.lang);
+        let title = self.t("JSON 查看器", "JSON Viewer");
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.into()));
+    }
+
     /// Resultados del hilo de actualización que merecen un toast.
     fn poll_updates(&mut self) {
         let Some(ev) = self.updater.poll() else { return };
+        let lang = self.set.lang;
         match ev {
-            Event::UpToDate => self.notify(format!("Ya tienes la última versión ({})", update::CURRENT)),
-            Event::Available(v) => self.notify(format!("Versión {v} disponible (ver la barra de estado)")),
-            Event::Ready(v) => self.notify(format!("Versión {v} instalada: reinicia para usarla")),
-            Event::Saved(p) => self.notify(format!("Ejecutable nuevo guardado en {}", p.display())),
-            Event::Error(e) => self.notify(format!("Actualizaciones: {e}")),
+            Event::UpToDate => self.notify(format!(
+                "{} ({})",
+                i18n::t(lang, "已是最新版本", "You already have the latest version"),
+                update::CURRENT
+            )),
+            Event::Available(v) => self.notify(format!(
+                "{} {v} {}",
+                i18n::t(lang, "发现新版本", "Version"),
+                i18n::t(lang, "可用（见状态栏）", "available (see status bar)")
+            )),
+            Event::Ready(v) => self.notify(format!(
+                "{} {v}{}",
+                i18n::t(lang, "已安装版本", "Version"),
+                i18n::t(lang, "：重启后生效", " installed — restart to use it")
+            )),
+            Event::Saved(p) => self.notify(format!(
+                "{} {}",
+                i18n::t(lang, "新可执行文件已保存到", "New executable saved to"),
+                p.display()
+            )),
+            Event::Error(e) => self.notify(format!("{}: {e}", i18n::t(lang, "更新", "Updates"))),
         }
     }
 
@@ -448,7 +556,7 @@ impl App {
         let uid = self.new_uid();
         let tab = DocTab::new(uid, title, path, text, &self.set);
         if let Some(e) = &tab.error {
-            self.toast = Some((format!("JSON inválido: {e}"), Instant::now()));
+            self.toast = Some((format!("{}: {}", self.t("JSON 无效", "Invalid JSON"), e.display(self.set.lang)), Instant::now()));
         }
         match self.tabs.get(self.active) {
             Some(t) if t.is_blank() => self.tabs[self.active] = tab,
@@ -471,7 +579,7 @@ impl App {
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
-                self.notify(format!("No se pudo abrir {}: {e}", path.display()));
+                self.notify(format!("{} {}: {e}", self.t("无法打开", "Could not open"), path.display()));
                 return None;
             }
         };
@@ -492,7 +600,7 @@ impl App {
     fn file_dialog(&self) -> rfd::FileDialog {
         let mut dlg = rfd::FileDialog::new()
             .add_filter("JSON", &["json", "jsonc", "json5", "geojson", "har", "txt", "log"])
-            .add_filter("Todos los archivos", &["*"]);
+            .add_filter(self.t("所有文件", "All files"), &["*"]);
         if let Some(dir) = self.tabs.get(self.active).and_then(|t| t.path.as_ref()).and_then(|p| p.parent()) {
             dlg = dlg.set_directory(dir);
         }
@@ -514,7 +622,7 @@ impl App {
             return self.open_import(text);
         }
         self.paste_n += 1;
-        self.push_tab(format!("Pegado {}", self.paste_n), None, text);
+        self.push_tab(format!("{} {}", self.t("粘贴", "Paste"), self.paste_n), None, text);
     }
 
     fn open_import(&mut self, text: String) {
@@ -524,12 +632,12 @@ impl App {
     fn import_window(&mut self, ctx: &egui::Context) {
         let Some(d) = self.import.as_mut() else { return };
         let indent = self.set.indent_str();
-        match import::window(ctx, d, &mut self.set.import, &indent) {
+        match import::window(ctx, d, &mut self.set.import, &indent, self.set.lang) {
             Some(import::Action::Convert(json, rows)) => {
                 self.import = None;
                 self.table_n += 1;
-                self.push_tab(format!("Tabla {}", self.table_n), None, json);
-                self.notify(format!("Tabla importada: {rows} {}", if rows == 1 { "fila" } else { "filas" }));
+                self.push_tab(format!("{} {}", self.t("表格", "Table"), self.table_n), None, json);
+                self.notify(format!("{}: {rows} {}", self.t("已导入表格", "Table imported"), self.t("行", "rows")));
             }
             Some(import::Action::Close) => self.import = None,
             None => {}
@@ -540,7 +648,7 @@ impl App {
         if self.tabs.get(self.active).is_some_and(|t| t.is_blank()) {
             return;
         }
-        self.push_tab("Nuevo".into(), None, String::new());
+        self.push_tab(self.t("新建", "New").into(), None, String::new());
     }
 
     fn close_tab(&mut self, i: usize) {
@@ -557,7 +665,7 @@ impl App {
     fn reload(&mut self) {
         if let Some(p) = self.tabs.get(self.active).and_then(|t| t.path.clone()) {
             self.open_path(p);
-            self.notify("Archivo recargado");
+            self.notify(self.t("文件已重新加载", "File reloaded"));
         }
     }
 
@@ -567,14 +675,14 @@ impl App {
         let mut dlg = rfd::FileDialog::new()
             .set_file_name(tab.file_name())
             .add_filter("JSON", &["json"])
-            .add_filter("Todos los archivos", &["*"]);
+            .add_filter(self.t("所有文件", "All files"), &["*"]);
         if let Some(dir) = tab.path.as_ref().and_then(|p| p.parent()) {
             dlg = dlg.set_directory(dir);
         }
         if let Some(path) = dlg.save_file() {
             match std::fs::write(&path, content) {
-                Ok(()) => self.notify(format!("Guardado en {}", path.display())),
-                Err(e) => self.notify(format!("Error al guardar: {e}")),
+                Ok(()) => self.notify(format!("{} {}", self.t("已保存到", "Saved to"), path.display())),
+                Err(e) => self.notify(format!("{}: {e}", self.t("保存失败", "Save error"))),
             }
         }
     }
@@ -643,9 +751,9 @@ impl App {
         let file = t.file_label().to_string();
         let path = l.doc.path(array);
         let title = match path.strip_prefix("$.") {
-            None => format!("{file} (tabla)"),
+            None => format!("{} ({})", file, i18n::t(self.set.lang, "表格", "table")),
             Some(name) if items.len() == total => format!("{file} · {name}"),
-            Some(name) => format!("{file} · {name} ({} de {total})", items.len()),
+            Some(name) => format!("{file} · {name} ({} / {total})", items.len()),
         };
         let uid = self.new_uid();
         let mut tab = DocTab::with_doc(uid, title, doc, &self.set);
@@ -668,7 +776,7 @@ impl App {
     fn compare_tabs(&mut self, li: usize, ri: usize) {
         let (Some(lt), Some(rt)) = (self.tabs.get(li), self.tabs.get(ri)) else { return };
         let (Some(l), Some(r)) = (lt.loaded.as_ref(), rt.loaded.as_ref()) else {
-            return self.notify("Una de las dos pestañas no tiene un JSON válido");
+            return self.notify(self.t("其中一个标签页没有有效的 JSON", "One of the two tabs has no valid JSON"));
         };
         let (left, right) = (l.doc.subtree(Doc::ROOT), r.doc.subtree(Doc::ROOT));
         let labels = (lt.title.clone(), rt.title.clone());
@@ -696,7 +804,7 @@ impl App {
         let (doc_gen, filter_gen) = t.shown_gen();
         let path = l.doc.path(id);
         self.mark = Some(CompareMark { uid: t.uid, doc_gen, filter_gen, id, path: path.clone() });
-        self.notify(format!("Seleccionado para comparar: {path}. Clic derecho en otro elemento → «Comparar con…»"));
+        self.notify(format!("{}: {path}. {}", self.t("已选择以便比较", "Selected for compare"), self.t("在另一元素上右键 →「与…比较」", "Right-click another item → “Compare with…”")));
     }
 
     /// Compara el nodo marcado con `id` de la pestaña activa en una pestaña nueva.
@@ -704,17 +812,17 @@ impl App {
         let Some(m) = self.mark.as_ref() else { return };
         let Some(mi) = self.tabs.iter().position(|t| t.uid == m.uid) else {
             self.mark = None;
-            return self.notify("La pestaña del elemento marcado ya se cerró");
+            return self.notify(self.t("已标记元素的标签页已关闭", "The tab of the marked item was closed"));
         };
         let mt = &self.tabs[mi];
         if mt.shown_gen() != (m.doc_gen, m.filter_gen) {
             self.mark = None;
-            return self.notify("El documento cambió: vuelve a marcar el elemento a comparar");
+            return self.notify(self.t("文档已更改：请重新标记要比较的元素", "Document changed: mark the item to compare again"));
         }
         let ct = &self.tabs[self.active];
         let (Some(ml), Some(rl)) = (mt.shown(), ct.shown()) else { return };
         if mi == self.active && m.id == id {
-            return self.notify("Elige un elemento distinto del marcado");
+            return self.notify(self.t("请选择与已标记不同的元素", "Choose an item different from the marked one"));
         }
         let (left, right) = (ml.doc.subtree(m.id), rl.doc.subtree(id));
         let labels = (header_label(mt, &ml.doc, m.id), header_label(ct, &rl.doc, id));
@@ -780,7 +888,7 @@ impl App {
             _ => find_in_source(ctx, tab, &q, forward),
         };
         if !found {
-            self.notify(format!("Sin coincidencias para «{}»", self.search));
+            self.notify(format!("{}「{}」", self.t("未找到", "No matches for"), self.search));
         }
     }
 
@@ -908,10 +1016,11 @@ impl App {
         let mut help = false;
         let mut quit = false;
         let mut check_updates = false;
-        icons::menu(ui, Icon::Menu, "Menú", |ui| {
-            ui.menu_button(icons::text(Icon::History, "Recientes"), |ui| {
+        let lang = self.set.lang;
+        icons::menu(ui, Icon::Menu, self.t("菜单", "Menu"), |ui| {
+            ui.menu_button(icons::text(Icon::History, i18n::t(lang, "最近打开", "Recent")), |ui| {
                 if self.set.recent.is_empty() {
-                    ui.label(RichText::new("(vacío)").weak());
+                    ui.label(RichText::new(i18n::t(lang, "（空）", "(empty)")).weak());
                 }
                 for p in &self.set.recent {
                     if ui.button(p).clicked() {
@@ -921,35 +1030,39 @@ impl App {
                 }
                 if !self.set.recent.is_empty() {
                     ui.separator();
-                    if icons::item(ui, Icon::Trash2, "Limpiar lista", "").clicked() {
+                    if icons::item(ui, Icon::Trash2, i18n::t(lang, "清空列表", "Clear list"), "").clicked() {
                         clear_recent = true;
                     }
                 }
             });
             ui.separator();
-            if icons::item_enabled(ui, !self.tabs.is_empty(), Icon::X, "Cerrar pestaña", "Ctrl+W").clicked() {
+            if icons::item_enabled(ui, !self.tabs.is_empty(), Icon::X, i18n::t(lang, "关闭标签页", "Close tab"), "Ctrl+W").clicked() {
                 close = true;
             }
             ui.separator();
-            let (icon, label) = if self.set.dark { (Icon::Sun, "Tema claro") } else { (Icon::Moon, "Tema oscuro") };
+            let (icon, label) = if self.set.dark {
+                (Icon::Sun, i18n::t(lang, "浅色主题", "Light theme"))
+            } else {
+                (Icon::Moon, i18n::t(lang, "深色主题", "Dark theme"))
+            };
             if icons::item(ui, icon, label, "").clicked() {
                 self.set.dark = !self.set.dark;
             }
-            if icons::item(ui, Icon::Keyboard, "Atajos de teclado", "").clicked() {
+            if icons::item(ui, Icon::Keyboard, i18n::t(lang, "键盘快捷键", "Keyboard shortcuts"), "").clicked() {
                 help = true;
             }
-            let r = icons::item_enabled(ui, !self.updater.busy(), Icon::RefreshCw, "Buscar actualizaciones…", "");
+            let r = icons::item_enabled(ui, !self.updater.busy(), Icon::RefreshCw, i18n::t(lang, "检查更新…", "Check for updates…"), "");
             if r.clicked() {
                 check_updates = true;
             }
-            r.on_hover_text(format!("Versión actual: {}", update::CURRENT));
+            r.on_hover_text(format!("{}: {}", i18n::t(lang, "当前版本", "Current version"), update::CURRENT));
             ui.separator();
-            if icons::item(ui, Icon::LogOut, "Salir", "").clicked() {
+            if icons::item(ui, Icon::LogOut, i18n::t(lang, "退出", "Quit"), "").clicked() {
                 quit = true;
             }
         });
         if check_updates {
-            self.updater.check(ui.ctx(), true);
+            self.updater.check(ui.ctx(), true, self.set.lang);
         }
         if let Some(p) = pick {
             self.open_path(p);
@@ -982,37 +1095,37 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
 
-            // Archivo
-            if icons::button(ui, Icon::FolderOpen, "Abrir archivo… (Ctrl+O)").clicked() {
+            let lang = self.set.lang;
+            if icons::button(ui, Icon::FolderOpen, self.t("打开文件… (Ctrl+O)", "Open file… (Ctrl+O)")).clicked() {
                 self.open_dialog();
             }
-            if icons::button(ui, Icon::FilePlus, "Nuevo documento para escribir (Ctrl+N)").clicked() {
+            if icons::button(ui, Icon::FilePlus, self.t("新建文档 (Ctrl+N)", "New document (Ctrl+N)")).clicked() {
                 self.new_blank();
                 self.set.view = View::Source;
             }
-            if icons::button(ui, Icon::ClipboardPaste, "Pegar como documento nuevo (Ctrl+V)").clicked() {
+            if icons::button(ui, Icon::ClipboardPaste, self.t("粘贴为新文档 (Ctrl+V)", "Paste as new document (Ctrl+V)")).clicked() {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
-            if icons::button(ui, Icon::Database, "Importar tabla de SQL Server… (Ctrl+I)").clicked() {
+            if icons::button(ui, Icon::Database, self.t("导入 SQL Server 表… (Ctrl+I)", "Import SQL Server table… (Ctrl+I)")).clicked() {
                 self.open_import(String::new());
             }
             let has_path = self.tabs.get(self.active).is_some_and(|t| t.path.is_some());
-            if icons::enabled_button(ui, has_path, Icon::RefreshCw, "Recargar archivo (F5)").clicked() {
+            if icons::enabled_button(ui, has_path, Icon::RefreshCw, self.t("重新加载文件 (F5)", "Reload file (F5)")).clicked() {
                 self.reload();
             }
             let loaded = self.tabs.get(self.active).is_some_and(|t| t.loaded.is_some());
             let mut save_pretty = None;
             if loaded {
-                icons::menu(ui, Icon::Save, "Guardar como…", |ui| {
-                    if icons::item(ui, Icon::Braces, "Formateado…", "").clicked() {
+                icons::menu(ui, Icon::Save, self.t("另存为…", "Save as…"), |ui| {
+                    if icons::item(ui, Icon::Braces, i18n::t(lang, "格式化…", "Formatted…"), "").clicked() {
                         save_pretty = Some(true);
                     }
-                    if icons::item(ui, Icon::Minimize2, "Minificado…", "").clicked() {
+                    if icons::item(ui, Icon::Minimize2, i18n::t(lang, "压缩…", "Minified…"), "").clicked() {
                         save_pretty = Some(false);
                     }
                 });
             } else {
-                icons::enabled_button(ui, false, Icon::Save, "Guardar como…");
+                icons::enabled_button(ui, false, Icon::Save, self.t("另存为…", "Save as…"));
             }
             if let Some(pretty) = save_pretty {
                 self.save_current(pretty);
@@ -1027,11 +1140,11 @@ impl App {
             let mut pick_table = false;
             ui.add_enabled_ui(!is_compare, |ui| {
                 if let Some(Mode::Table(m)) = self.tabs.get(self.active).map(|t| &t.mode)
-                    && icons::selectable(ui, m.show, Icon::Table, "Tabla: una fila por elemento").clicked()
+                    && icons::selectable(ui, m.show, Icon::Table, i18n::t(lang, "表格：每元素一行", "Table: one row per item")).clicked()
                 {
                     pick_table = true;
                 }
-                for (v, icon, label, key) in VIEWS {
+                for (v, icon, label, key) in views(self.set.lang) {
                     let on = !is_compare && !table_shown && view == v;
                     if icons::selectable(ui, on, icon, &format!("{label} ({key})")).clicked() {
                         pick_view = Some(v);
@@ -1051,7 +1164,7 @@ impl App {
             let mut msg = None;
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 if let Mode::Compare(c) = &mut tab.mode {
-                    if icons::button(ui, Icon::ArrowLeftRight, "Intercambiar lados").clicked() {
+                    if icons::button(ui, Icon::ArrowLeftRight, i18n::t(lang, "交换两侧", "Swap sides")).clicked() {
                         c.swap();
                     }
                     toolbar_sep(ui);
@@ -1060,88 +1173,91 @@ impl App {
                 } else if table_shown {
                     if let Some(l) = tab.shown()
                         && let Some(t) = &l.table
-                        && icons::button(ui, Icon::Copy, "Copiar la tabla (separada por tabuladores)").clicked()
+                        && icons::button(ui, Icon::Copy, i18n::t(lang, "复制表格（制表符分隔）", "Copy table (tab-separated)")).clicked()
                     {
                         ui.ctx().copy_text(table::to_tsv(&l.doc, t));
-                        msg = Some("Tabla copiada");
+                        msg = Some(i18n::t(lang, "表格已复制", "Table copied"));
                     }
                 } else {
                     match (view, tab.shown_mut()) {
                         (View::Tree, Some(l)) => {
-                            if icons::button(ui, Icon::UnfoldVertical, "Expandir todo").clicked() {
+                            if icons::button(ui, Icon::UnfoldVertical, i18n::t(lang, "全部展开", "Expand all")).clicked() {
                                 l.tree.set_all(Fold::Expanded);
                             }
-                            if icons::button(ui, Icon::FoldVertical, "Cerrar todo").clicked() {
+                            if icons::button(ui, Icon::FoldVertical, i18n::t(lang, "全部折叠", "Collapse all")).clicked() {
                                 l.tree.level(&l.doc, 1, Fold::Closed);
                             }
                             if icons::button(
                                 ui,
                                 Icon::ListCollapse,
-                                "Compactar todo: raíz abierta, cada hijo en una línea",
+                                i18n::t(lang, "全部压缩：根展开，子节点各一行", "Compact all: root open, each child one line"),
                             )
                             .clicked()
                             {
                                 l.tree.level(&l.doc, 1, Fold::Compact);
                             }
                             let auto_tip = format!(
-                                "Auto: compacta en una línea lo que quepa en {} columnas (se ajusta en Ajustes)",
-                                set.auto_width
+                                "{} {} {}",
+                                i18n::t(lang, "自动：按", "Auto: fit within"),
+                                set.auto_width,
+                                i18n::t(lang, "列宽压缩为一行（可在设置中调整）", "columns (adjust in Settings)"),
                             );
                             if icons::button(ui, Icon::WandSparkles, &auto_tip).clicked() {
                                 l.tree.auto(&l.doc, Doc::ROOT, set);
                             }
-                            icons::menu(ui, Icon::Layers, "Expandir hasta un nivel", |ui| {
+                            icons::menu(ui, Icon::Layers, i18n::t(lang, "展开到某一层", "Expand to level"), |ui| {
                                 for lv in 1..=5 {
-                                    if ui.button(format!("Nivel {lv}")).clicked() {
+                                    if ui.button(format!("{} {lv}", i18n::t(lang, "第", "Level"))).clicked() {
                                         let rest = if set.level_compact { Fold::Compact } else { Fold::Closed };
                                         l.tree.level(&l.doc, lv, rest);
                                         ui.close();
                                     }
                                 }
                                 ui.separator();
-                                ui.checkbox(&mut set.level_compact, "Resto compacto").on_hover_text(
-                                    "Lo que queda fuera del nivel se compacta en una línea en vez de cerrarse",
+                                ui.checkbox(&mut set.level_compact, i18n::t(lang, "其余压缩", "Rest compact")).on_hover_text(
+                                    i18n::t(lang, "层级以外的节点压缩为一行而不是折叠", "Nodes beyond the level are compacted instead of closed"),
                                 );
                             });
                         }
                         (View::Text, Some(l)) => {
                             l.text.ensure(&l.doc, &set.indent_str());
-                            if icons::button(ui, Icon::Copy, "Copiar todo el texto").clicked() {
+                            if icons::button(ui, Icon::Copy, i18n::t(lang, "复制全部文本", "Copy all text")).clicked() {
                                 ui.ctx().copy_text(l.text.text().to_string());
-                                msg = Some("Texto copiado");
+                                msg = Some(i18n::t(lang, "文本已复制", "Text copied"));
                             }
                         }
                         _ => {
-                            if icons::enabled_button(ui, tab.source_dirty, Icon::Check, "Aplicar cambios (Ctrl+Enter)")
+                            if icons::enabled_button(ui, tab.source_dirty, Icon::Check, i18n::t(lang, "应用更改 (Ctrl+Enter)", "Apply changes (Ctrl+Enter)"))
                                 .clicked()
                             {
                                 tab.parse(set);
                             }
+                            let lang = set.lang;
                             let fmt = |src: &str, layout: Layout| {
-                                json::parse(src).map(|d| json::to_string(&d, Doc::ROOT, layout))
+                                json::parse_with(src, lang).map(|d| json::to_string(&d, Doc::ROOT, layout))
                             };
-                            let format_tip = "Formatear: reescribe la fuente con sangría (quita comentarios)";
+                            let format_tip = i18n::t(lang, "格式化：按缩进重写源码（会去掉注释）", "Format: rewrite source with indent (strips comments)");
                             if icons::button(ui, Icon::IndentIncrease, format_tip).clicked() {
                                 match fmt(&tab.source, Layout::Pretty(&set.indent_str())) {
                                     Ok(s) => {
                                         tab.set_source(s);
                                         tab.parse(set);
                                     }
-                                    Err(_) => msg = Some("No se puede formatear: el JSON tiene errores"),
+                                    Err(_) => msg = Some(i18n::t(lang, "无法格式化：JSON 有错误", "Cannot format: JSON has errors")),
                                 }
                             }
-                            if icons::button(ui, Icon::Minimize2, "Minificar: todo en una línea").clicked() {
+                            if icons::button(ui, Icon::Minimize2, i18n::t(lang, "压缩：全部放在一行", "Minify: everything on one line")).clicked() {
                                 match fmt(&tab.source, Layout::Minified) {
                                     Ok(s) => {
                                         tab.set_source(s);
                                         tab.parse(set);
                                     }
-                                    Err(_) => msg = Some("No se puede minificar: el JSON tiene errores"),
+                                    Err(_) => msg = Some(i18n::t(lang, "无法压缩：JSON 有错误", "Cannot minify: JSON has errors")),
                                 }
                             }
-                            if icons::button(ui, Icon::Copy, "Copiar la fuente").clicked() {
+                            if icons::button(ui, Icon::Copy, i18n::t(lang, "复制源码", "Copy source")).clicked() {
                                 ui.ctx().copy_text(tab.source.clone());
-                                msg = Some("Fuente copiada");
+                                msg = Some(i18n::t(lang, "源码已复制", "Source copied"));
                             }
                         }
                     }
@@ -1154,13 +1270,11 @@ impl App {
             // Paneles y menú
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.overflow_menu(ui);
-                icons::toggle(ui, &mut self.set.show_settings, Icon::Settings2, "Ajustes");
-                icons::toggle(
-                    ui,
-                    &mut self.set.show_filter,
-                    Icon::Filter,
-                    "Filtro por claves: mostrar solo ciertas claves y el camino hasta ellas",
-                );
+                let tip_settings = self.t("设置", "Settings");
+                let tip_filter =
+                    self.t("按键过滤：只显示指定键及其路径", "Key filter: show only selected keys and their path");
+                icons::toggle(ui, &mut self.set.show_settings, Icon::Settings2, tip_settings);
+                icons::toggle(ui, &mut self.set.show_filter, Icon::Filter, tip_filter);
             });
         });
     }
@@ -1169,23 +1283,20 @@ impl App {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let mut go = None;
-            if icons::button(ui, Icon::ChevronDown, "Siguiente coincidencia (F3 / Enter)").clicked() {
+            if icons::button(ui, Icon::ChevronDown, self.t("下一处匹配 (F3 / Enter)", "Next match (F3 / Enter)")).clicked() {
                 go = Some(true);
             }
-            if icons::button(ui, Icon::ChevronUp, "Coincidencia anterior (Mayús+F3 / Mayús+Enter)").clicked() {
+            if icons::button(ui, Icon::ChevronUp, self.t("上一处匹配 (Shift+F3 / Shift+Enter)", "Previous match (Shift+F3 / Shift+Enter)")).clicked() {
                 go = Some(false);
             }
             if let Some(c) = self.match_count() {
-                ui.label(RichText::new(c.to_string()).weak()).on_hover_text(if c == 1 {
-                    "1 coincidencia"
-                } else {
-                    "Coincidencias"
-                });
+                ui.label(RichText::new(c.to_string()).weak()).on_hover_text(self.t("匹配数", "Matches"));
             }
+            let search_hint = self.t("搜索键或值 (Ctrl+F)", "Search key or value (Ctrl+F)");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
                     .id(Id::new("search_box"))
-                    .hint_text(icons::text(Icon::Search, "Buscar clave o valor (Ctrl+F)"))
+                    .hint_text(icons::text(Icon::Search, search_hint))
                     .desired_width(220.0),
             );
             if self.focus_search {
@@ -1237,7 +1348,7 @@ impl App {
                                 rect
                             }
                             None => {
-                                let (rect, act, dragged) = tab_widget(ui, t, active, &others);
+                                let (rect, act, dragged) = tab_widget(ui, t, active, &others, self.set.lang);
                                 if dragged {
                                     dragging = Some(i);
                                 }
@@ -1254,7 +1365,7 @@ impl App {
                         rects.push(rect);
                     }
                     ui.add_space(4.0);
-                    if icons::button(ui, Icon::Plus, "Nuevo documento (Ctrl+N)").clicked() {
+                    if icons::button(ui, Icon::Plus, self.t("新建文档 (Ctrl+N)", "New document (Ctrl+N)")).clicked() {
                         new = true;
                     }
                 });
@@ -1359,10 +1470,10 @@ impl App {
                     if sel != NONE {
                         let path = l.doc.path(sel);
                         let line = l.doc.node(sel).line;
-                        let text = if l.doc.src_lines > 1 { format!("{path}  · línea {line}") } else { path.clone() };
+                        let text = if l.doc.src_lines > 1 { format!("{}  · {} {}", path, i18n::t(self.set.lang, "行", "line"), line) } else { path.clone() };
                         if ui
                             .add(egui::Label::new(RichText::new(text).monospace()).sense(egui::Sense::click()))
-                            .on_hover_text("Clic para copiar la ruta")
+                            .on_hover_text(self.t("点击复制路径", "Click to copy path"))
                             .clicked()
                         {
                             ui.ctx().copy_text(path);
@@ -1376,13 +1487,16 @@ impl App {
                         Mode::Compare(c) => {
                             if let Some((d, _)) = &c.diff {
                                 let (l, r) = c.docs();
+                                let lang = self.set.lang;
                                 let s = format!(
-                                    "{} ↔ {} nodos · +{} −{} ~{} líneas",
+                                    "{} ↔ {} {} · +{} −{} ~{} {}",
                                     l.len(),
                                     r.len(),
+                                    i18n::t(lang, "节点", "nodes"),
                                     d.added,
                                     d.removed,
-                                    d.modified
+                                    d.modified,
+                                    i18n::t(lang, "行", "lines"),
                                 );
                                 ui.label(RichText::new(s).weak());
                             }
@@ -1392,21 +1506,27 @@ impl App {
                             if let (Some(l), Some(full)) = (tab.shown(), &tab.loaded) {
                                 parts.insert(
                                     0,
-                                    if tab.filtered.is_some() {
-                                        format!("{} de {} nodos (filtrado)", l.doc.len(), full.doc.len())
-                                    } else {
-                                        format!("{} nodos", l.doc.len())
+                                    {
+                                        let lang = self.set.lang;
+                                        if tab.filtered.is_some() {
+                                            format!("{} / {} {} ({})", l.doc.len(), full.doc.len(), i18n::t(lang, "节点", "nodes"), i18n::t(lang, "已过滤", "filtered"))
+                                        } else {
+                                            format!("{} {}", l.doc.len(), i18n::t(lang, "节点", "nodes"))
+                                        }
                                     },
                                 );
                                 if tab.table_shown() {
                                     if let Some(t) = &l.table {
-                                        parts.insert(0, format!("{} filas × {} columnas", t.rows(&l.doc), t.cols()));
+                                        let lang = self.set.lang;
+                                        parts.insert(0, format!("{} {} × {} {}", t.rows(&l.doc), i18n::t(lang, "行", "rows"), t.cols(), i18n::t(lang, "列", "cols")));
                                     }
                                 } else {
+                                    let lang = self.set.lang;
+                                    let lines = i18n::t(lang, "行", "lines");
                                     match view {
-                                        View::Tree => parts.insert(1, format!("{} líneas", l.tree.line_count())),
-                                        View::Text => parts.insert(1, format!("{} líneas", l.text.line_count())),
-                                        View::Source => parts.insert(1, format!("{} líneas", tab.source_lines)),
+                                        View::Tree => parts.insert(1, format!("{} {}", l.tree.line_count(), lines)),
+                                        View::Text => parts.insert(1, format!("{} {}", l.text.line_count(), lines)),
+                                        View::Source => parts.insert(1, format!("{} {}", tab.source_lines, lines)),
                                     }
                                 }
                                 if full.parse_ms > 0.0 {
@@ -1433,47 +1553,51 @@ impl App {
         match &self.updater.status {
             Status::Available(rel) => {
                 ui.separator();
-                let notes = ui.small_button("Ver notas").on_hover_text(&rel.notes_url);
+                let lang = self.set.lang;
+                let notes = ui.small_button(i18n::t(lang, "查看说明", "Release notes")).on_hover_text(&rel.notes_url);
                 let tip = format!(
-                    "Descarga {} ({}) junto al ejecutable actual y lo reemplaza; luego se pide reiniciar.\n{}",
+                    "{} {} ({}){}\n{}",
+                    i18n::t(lang, "下载", "Download"),
                     rel.asset_name,
                     human_size(rel.size as usize),
-                    update::sha_note(rel)
+                    i18n::t(lang, " 并替换当前程序，然后提示重启。", " next to the current exe and replace it; then asks to restart."),
+                    update::sha_note(rel, lang)
                 );
-                let go = ui.small_button(icons::text(Icon::Download, "Actualizar")).on_hover_text(tip);
-                ui.label(RichText::new(format!("Versión {} disponible", rel.version)).color(accent));
+                let go = ui.small_button(icons::text(Icon::Download, i18n::t(lang, "更新", "Update"))).on_hover_text(tip);
+                ui.label(RichText::new(format!("{} {} {}", i18n::t(lang, "版本", "Version"), rel.version, i18n::t(lang, "可用", "available"))).color(accent));
                 if notes.clicked() {
                     ctx.open_url(egui::OpenUrl::new_tab(&rel.notes_url));
                 }
                 if go.clicked() {
-                    self.updater.download(&ctx);
+                    self.updater.download(&ctx, self.set.lang);
                 }
             }
             Status::Downloading { release, received, total } => {
                 ui.separator();
                 let frac = if *total > 0 { (*received as f32 / *total as f32).min(1.0) } else { 0.0 };
                 ui.add(egui::ProgressBar::new(frac).desired_width(110.0).show_percentage());
-                ui.label(RichText::new(format!("Descargando la versión {}…", release.version)).weak());
+                ui.label(RichText::new(format!("{} {}…", self.t("正在下载版本", "Downloading version"), release.version)).weak());
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
             Status::Ready { version } => {
                 ui.separator();
                 let version = version.clone();
+                let lang = self.set.lang;
                 if self.updater.postponed {
                     if ui
-                        .small_button(icons::text(Icon::RotateCw, "Reiniciar"))
-                        .on_hover_text("Usar la versión nueva")
+                        .small_button(icons::text(Icon::RotateCw, i18n::t(lang, "重启", "Restart")))
+                        .on_hover_text(i18n::t(lang, "使用新版本", "Use the new version"))
                         .clicked()
                     {
                         self.restart(&ctx);
                     }
-                    ui.label(RichText::new(format!("Versión {version} lista")).weak());
+                    ui.label(RichText::new(format!("{} {version} {}", i18n::t(lang, "版本", "Version"), i18n::t(lang, "已就绪", "ready"))).weak());
                 } else {
                     let later = ui
-                        .small_button("Más tarde")
-                        .on_hover_text("La versión nueva se usará la próxima vez que abras el programa");
-                    let now = ui.small_button(icons::text(Icon::RotateCw, "Reiniciar ahora"));
-                    ui.label(RichText::new(format!("Versión {version} instalada")).color(accent));
+                        .small_button(i18n::t(lang, "稍后", "Later"))
+                        .on_hover_text(i18n::t(lang, "下次打开程序时使用新版本", "The new version will be used next time you open the app"));
+                    let now = ui.small_button(icons::text(Icon::RotateCw, i18n::t(lang, "立即重启", "Restart now")));
+                    ui.label(RichText::new(format!("{} {version} {}", i18n::t(lang, "版本", "Version"), i18n::t(lang, "已安装", "installed"))).color(accent));
                     if later.clicked() {
                         self.updater.postponed = true;
                     }
@@ -1484,14 +1608,18 @@ impl App {
             }
             Status::Saved { version, path, reason } => {
                 ui.separator();
-                let dismiss = ui.small_button("Descartar aviso");
-                let show = ui.small_button(icons::text(Icon::ExternalLink, "Ver archivo"));
+                let lang = self.set.lang;
+                let dismiss = ui.small_button(i18n::t(lang, "忽略", "Dismiss"));
+                let show = ui.small_button(icons::text(Icon::ExternalLink, i18n::t(lang, "查看文件", "Show file")));
                 let tip = format!(
-                    "{reason}\nEl ejecutable nuevo quedó en:\n{}\nReemplaza con él el actual cuando puedas.",
-                    path.display()
+                    "{}\n{}\n{}\n{}",
+                    reason,
+                    i18n::t(lang, "新可执行文件位于：", "New executable is at:"),
+                    path.display(),
+                    i18n::t(lang, "请稍后手动替换当前程序。", "Replace the current program with it when you can."),
                 );
                 ui.label(
-                    RichText::new(format!("Versión {version} descargada, sin instalar"))
+                    RichText::new(format!("{} {version} {}", i18n::t(lang, "版本", "Version"), i18n::t(lang, "已下载但未安装", "downloaded, not installed")))
                         .color(ui.visuals().warn_fg_color),
                 )
                 .on_hover_text(&tip);
@@ -1515,94 +1643,104 @@ impl App {
     }
 
     fn settings_panel(&mut self, ui: &mut Ui) {
+        let lang = self.set.lang;
         let s = &mut self.set;
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(icons::text(Icon::Settings2, "Ajustes"));
+                ui.heading(icons::text(Icon::Settings2, i18n::t(lang, "设置", "Settings")));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icons::button(ui, Icon::X, "Ocultar panel").clicked() {
+                    if icons::button(ui, Icon::X, i18n::t(lang, "隐藏面板", "Hide panel")).clicked() {
                         s.show_settings = false;
                     }
                 });
             });
             ui.add_space(4.0);
             egui::Grid::new("settings_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Tema");
+                ui.label(i18n::t(lang, "语言", "Language"));
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut s.dark, true, icons::text(Icon::Moon, "Oscuro"));
-                    ui.selectable_value(&mut s.dark, false, icons::text(Icon::Sun, "Claro"));
+                    for l in Lang::ALL {
+                        ui.selectable_value(&mut s.lang, l, l.label());
+                    }
                 });
                 ui.end_row();
-                ui.label("Tamaño de letra");
+                ui.label(i18n::t(lang, "主题", "Theme"));
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut s.dark, true, icons::text(Icon::Moon, i18n::t(lang, "深色", "Dark")));
+                    ui.selectable_value(&mut s.dark, false, icons::text(Icon::Sun, i18n::t(lang, "浅色", "Light")));
+                });
+                ui.end_row();
+                ui.label(i18n::t(lang, "字号", "Font size"));
                 ui.add(egui::Slider::new(&mut s.font_size, 9.0..=24.0).step_by(0.5));
                 ui.end_row();
-                ui.label("Escala");
+                ui.label(i18n::t(lang, "界面缩放", "UI scale"));
                 ui.add(egui::Slider::new(&mut s.ui_scale, 0.75..=2.0).step_by(0.05));
                 ui.end_row();
-                ui.label("Sangría");
+                ui.label(i18n::t(lang, "缩进", "Indent"));
                 indent_picker(ui, &mut s.indent);
                 ui.end_row();
             });
-            ui.checkbox(&mut s.line_numbers, "Números de línea (árbol, texto y fuente)");
+            ui.checkbox(&mut s.line_numbers, i18n::t(lang, "显示行号（树 / 文本 / 源码）", "Line numbers (tree, text and source)"));
 
             ui.separator();
-            ui.strong("Árbol");
-            ui.checkbox(&mut s.show_guides, "Guías de sangría");
-            ui.checkbox(&mut s.show_counts, "Mostrar cantidad en nodos cerrados");
-            ui.checkbox(&mut s.show_indices, "Mostrar índices de arreglo");
-            ui.checkbox(&mut s.show_commas, "Mostrar comas");
-            ui.checkbox(&mut s.quote_keys, "Comillas en claves");
+            ui.strong(i18n::t(lang, "树形视图", "Tree"));
+            ui.checkbox(&mut s.show_guides, i18n::t(lang, "缩进参考线", "Indent guides"));
+            ui.checkbox(&mut s.show_counts, i18n::t(lang, "折叠节点显示数量", "Show counts on closed nodes"));
+            ui.checkbox(&mut s.show_indices, i18n::t(lang, "显示数组下标", "Show array indices"));
+            ui.checkbox(&mut s.show_commas, i18n::t(lang, "显示逗号", "Show commas"));
+            ui.checkbox(&mut s.quote_keys, i18n::t(lang, "键名加引号", "Quote keys"));
             ui.horizontal(|ui| {
-                ui.label("Máx. caracteres por línea compacta");
+                ui.label(i18n::t(lang, "压缩行最大字符数", "Max chars per compact line"));
                 ui.add(egui::DragValue::new(&mut s.compact_limit).range(100..=100_000));
             });
 
             ui.separator();
-            ui.strong("Al abrir un documento");
-            ui.radio_value(&mut s.initial, InitialFold::Auto, "Auto: compactar lo que quepa en una línea");
-            ui.radio_value(&mut s.initial, InitialFold::Level, "Expandir hasta un nivel, cerrar el resto");
-            ui.radio_value(&mut s.initial, InitialFold::LevelCompact, "Expandir hasta un nivel, compactar el resto");
-            ui.radio_value(&mut s.initial, InitialFold::ExpandAll, "Expandir todo");
+            ui.strong(i18n::t(lang, "打开文档时", "On open"));
+            ui.radio_value(&mut s.initial, InitialFold::Auto, i18n::t(lang, "自动：能放进一行的就压缩", "Auto: compact what fits on one line"));
+            ui.radio_value(&mut s.initial, InitialFold::Level, i18n::t(lang, "展开到某一层，其余折叠", "Expand to a level, close the rest"));
+            ui.radio_value(&mut s.initial, InitialFold::LevelCompact, i18n::t(lang, "展开到某一层，其余压缩", "Expand to a level, compact the rest"));
+            ui.radio_value(&mut s.initial, InitialFold::ExpandAll, i18n::t(lang, "全部展开", "Expand all"));
             egui::Grid::new("initial_grid").num_columns(2).show(ui, |ui| {
-                ui.label("Ancho (Auto)");
-                ui.add(egui::DragValue::new(&mut s.auto_width).range(20..=400).suffix(" col"));
+                ui.label(i18n::t(lang, "宽度（自动）", "Width (Auto)"));
+                ui.add(egui::DragValue::new(&mut s.auto_width).range(20..=400).suffix(i18n::t(lang, " 列", " col")));
                 ui.end_row();
-                ui.label("Nivel");
+                ui.label(i18n::t(lang, "层级", "Level"));
                 ui.add(egui::DragValue::new(&mut s.initial_level).range(0..=50));
                 ui.end_row();
             });
 
             ui.separator();
-            ui.strong("Actualizaciones");
-            ui.checkbox(&mut s.check_updates, "Buscar actualizaciones al iniciar").on_hover_text(
-                "Consulta GitHub como mucho una vez al día y avisa en la barra de estado si hay una versión nueva",
+            ui.strong(i18n::t(lang, "更新", "Updates"));
+            ui.checkbox(&mut s.check_updates, i18n::t(lang, "启动时检查更新", "Check for updates on start")).on_hover_text(
+                i18n::t(lang, "最多每天查询一次 GitHub，有新版本时在状态栏提示", "Queries GitHub at most once a day and shows new versions in the status bar"),
             );
-            ui.label(RichText::new(format!("Versión actual: {}", update::CURRENT)).weak());
+            ui.label(RichText::new(format!("{}: {}", i18n::t(lang, "当前版本", "Current version"), update::CURRENT)).weak());
 
             ui.separator();
-            if ui.button(icons::text(Icon::RotateCcw, "Restablecer valores predeterminados")).clicked() {
+            if ui.button(icons::text(Icon::RotateCcw, i18n::t(lang, "恢复默认设置", "Reset to defaults"))).clicked() {
                 let recent = std::mem::take(&mut s.recent);
                 let filter_keys = std::mem::take(&mut s.filter_keys);
-                *s = Settings { recent, filter_keys, show_settings: true, ..Default::default() };
+                let lang = s.lang;
+                *s = Settings { recent, filter_keys, show_settings: true, lang, ..Default::default() };
             }
         });
     }
 
     fn filter_panel(&mut self, ui: &mut Ui) {
+        let lang = self.set.lang;
         ui.horizontal(|ui| {
-            ui.heading(icons::text(Icon::Filter, "Filtro por claves"));
+            ui.heading(icons::text(Icon::Filter, i18n::t(lang, "按键过滤", "Key filter")));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icons::button(ui, Icon::X, "Ocultar panel").clicked() {
+                if icons::button(ui, Icon::X, i18n::t(lang, "隐藏面板", "Hide panel")).clicked() {
                     self.set.show_filter = false;
                 }
             });
         });
         ui.label(
-            RichText::new("Muestra solo estas claves y el camino desde la raíz hasta ellas. No distingue mayúsculas.")
+            RichText::new(i18n::t(lang, "只显示这些键及其从根到键的路径。不区分大小写。", "Show only these keys and the path from the root. Case-insensitive."))
                 .weak(),
         );
         ui.add_space(4.0);
-        ui.checkbox(&mut self.set.filter_on, "Aplicar filtro");
+        ui.checkbox(&mut self.set.filter_on, i18n::t(lang, "启用过滤", "Apply filter"));
         ui.add_space(4.0);
 
         // Coincidencias por fila, según la posición de la clave en el filtro activo.
@@ -1640,12 +1778,12 @@ impl App {
                     ui.allocate_ui_with_layout(size, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let start = ui.available_width();
                         if !last {
-                            if icons::small(ui, Icon::X, "Quitar esta clave").clicked() {
+                            if icons::small(ui, Icon::X, i18n::t(lang, "移除此键", "Remove this key")).clicked() {
                                 remove = Some(i);
                             }
                             match counts.get(i).copied().flatten() {
-                                Some(0) => ui.label(RichText::new("0").color(warn)).on_hover_text("Sin coincidencias"),
-                                Some(c) => ui.label(RichText::new(c.to_string()).weak()).on_hover_text("Coincidencias"),
+                                Some(0) => ui.label(RichText::new("0").color(warn)).on_hover_text(i18n::t(lang, "无匹配", "No matches")),
+                                Some(c) => ui.label(RichText::new(c.to_string()).weak()).on_hover_text(i18n::t(lang, "匹配数", "Matches")),
                                 None => ui.label(""),
                             };
                         }
@@ -1655,7 +1793,7 @@ impl App {
                         }
                         let edit = egui::TextEdit::singleline(k)
                             .id(Id::new(("filter_key", i)))
-                            .hint_text(if last { "Agregar clave…" } else { "" })
+                            .hint_text(if last { i18n::t(lang, "添加键…", "Add key…") } else { "" })
                             .font(TextStyle::Monospace)
                             .desired_width(ui.available_width());
                         let resp = ui.add(edit);
@@ -1671,16 +1809,16 @@ impl App {
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui.add_enabled(n > 1, egui::Button::new(icons::text(Icon::Trash2, "Quitar todas"))).clicked() {
+            if ui.add_enabled(n > 1, egui::Button::new(icons::text(Icon::Trash2, i18n::t(lang, "全部清除", "Clear all")))).clicked() {
                 self.set.filter_keys.clear();
             }
         });
-        ui.label(RichText::new("Tip: clic derecho en un nodo → «Filtrar por esta clave».").weak().small());
+        ui.label(RichText::new(i18n::t(lang, "提示：在节点上右键 →「按此键过滤」", "Tip: right-click a node → “Filter by this key”.")).weak().small());
     }
 
     fn central(&mut self, ui: &mut Ui) {
         if self.tabs.is_empty() {
-            match welcome(ui) {
+            match welcome(ui, self.set.lang) {
                 Some(Welcome::Open) => self.open_dialog(),
                 Some(Welcome::Import) => self.open_import(String::new()),
                 None => {}
@@ -1699,7 +1837,7 @@ impl App {
         // Pestaña de comparación: aviso de filtro, lista de cambios y diff.
         if let Mode::Compare(c) = &mut tab.mode {
             if c.filtered.is_some() {
-                filter_off = filter_banner(ui, &active_filter, &c.filter_counts);
+                filter_off = filter_banner(ui, &active_filter, &c.filter_counts, set.lang);
             }
             c.ensure(set);
             let labels = (c.labels.0.as_str(), c.labels.1.as_str());
@@ -1724,13 +1862,13 @@ impl App {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(icons::text(Icon::TriangleAlert, &e.to_string()))
+                            RichText::new(icons::text(Icon::TriangleAlert, &e.display(set.lang)))
                                 .color(ui.visuals().error_fg_color),
                         );
                         if tab.loaded.is_some() {
-                            ui.label(RichText::new("· se muestra la última versión válida").weak());
+                            ui.label(RichText::new(i18n::t(set.lang, "· 显示上一份有效版本", "· showing last valid version")).weak());
                         }
-                        if ui.small_button(icons::text(Icon::Crosshair, "Ir al error")).clicked() {
+                        if ui.small_button(icons::text(Icon::Crosshair, i18n::t(set.lang, "转到错误处", "Go to error"))).clicked() {
                             goto = true;
                         }
                     });
@@ -1750,7 +1888,7 @@ impl App {
         let table_shown = tab.table_shown();
         let view = if tab.loaded.is_some() { set.view } else { View::Source };
         if tab.filtered.is_some() && (table_shown || view != View::Source) {
-            filter_off = filter_banner(ui, &active_filter, &tab.filter_counts);
+            filter_off = filter_banner(ui, &active_filter, &tab.filter_counts, set.lang);
         }
 
         let mut out = None;
@@ -1792,7 +1930,7 @@ fn side_label(tab: &DocTab, doc: &Doc, id: NodeId) -> String {
         return file.to_string();
     }
     if doc.src_lines > 1 {
-        format!("{file} línea {}", doc.node(id).line)
+        format!("{} {} {}", file, "L", doc.node(id).line)
     } else {
         format!("{file} {}", doc.path(id).trim_start_matches('$').trim_start_matches('.'))
     }
@@ -1802,13 +1940,13 @@ fn side_label(tab: &DocTab, doc: &Doc, id: NodeId) -> String {
 fn header_label(tab: &DocTab, doc: &Doc, id: NodeId) -> String {
     let mut s = format!("{} · {}", tab.file_label(), doc.path(id));
     if id != Doc::ROOT && doc.src_lines > 1 {
-        s.push_str(&format!(" · línea {}", doc.node(id).line));
+        s.push_str(&format!(" · L{}", doc.node(id).line));
     }
     s
 }
 
 /// Aviso de filtro activo con sus coincidencias. Devuelve `true` si se pidió quitar el filtro.
-fn filter_banner(ui: &mut Ui, keys: &[&str], counts: &[usize]) -> bool {
+fn filter_banner(ui: &mut Ui, keys: &[&str], counts: &[usize], lang: Lang) -> bool {
     let mut off = false;
     let total: usize = counts.iter().sum();
     let missing: Vec<&str> = keys.iter().zip(counts).filter(|(_, c)| **c == 0).map(|(k, _)| *k).collect();
@@ -1817,15 +1955,14 @@ fn filter_banner(ui: &mut Ui, keys: &[&str], counts: &[usize]) -> bool {
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let what = if total == 1 { "coincidencia" } else { "coincidencias" };
-                ui.label(icons::text(Icon::Filter, &format!("Filtro por claves: {total} {what}")));
+                ui.label(icons::text(Icon::Filter, &format!("{}: {total} {}", i18n::t(lang, "按键过滤", "Key filter"), i18n::t(lang, "处匹配", "matches"))));
                 if !missing.is_empty() {
                     ui.label(
-                        RichText::new(format!("· sin coincidencias: {}", missing.join(", ")))
+                        RichText::new(format!("· {}: {}", i18n::t(lang, "无匹配", "no matches"), missing.join(", ")))
                             .color(ui.visuals().warn_fg_color),
                     );
                 }
-                if ui.small_button(icons::text(Icon::FilterX, "Quitar filtro")).clicked() {
+                if ui.small_button(icons::text(Icon::FilterX, i18n::t(lang, "清除过滤", "Clear filter"))).clicked() {
                     off = true;
                 }
             });
@@ -1835,28 +1972,29 @@ fn filter_banner(ui: &mut Ui, keys: &[&str], counts: &[usize]) -> bool {
 
 /// Opciones y navegación de una comparación.
 fn diff_tools(ui: &mut Ui, set: &mut Settings, diff: Option<(&Diff, &mut DiffView)>) {
-    icons::toggle(ui, &mut set.diff_sort_keys, Icon::ArrowDownAZ, "Ignorar orden de claves");
+    let lang = set.lang;
+    icons::toggle(ui, &mut set.diff_sort_keys, Icon::ArrowDownAZ, i18n::t(lang, "忽略键顺序", "Ignore key order"));
     icons::toggle(
         ui,
         &mut set.diff_only_changes,
         Icon::Diff,
-        "Solo diferencias: pliega las líneas iguales lejos de un cambio",
+        i18n::t(lang, "仅差异：折叠远离变更的相同行", "Only changes: fold equal lines far from a change"),
     );
-    icons::toggle(ui, &mut set.diff_show_list, Icon::List, "Lista de cambios por ruta");
+    icons::toggle(ui, &mut set.diff_show_list, Icon::List, i18n::t(lang, "按路径列出变更", "Change list by path"));
     toolbar_sep(ui);
     if let Some((d, v)) = diff {
-        if icons::button(ui, Icon::ChevronUp, "Diferencia anterior (Mayús+F7)").clicked() {
+        if icons::button(ui, Icon::ChevronUp, i18n::t(lang, "上一处差异 (Shift+F7)", "Previous diff (Shift+F7)")).clicked() {
             v.step(false);
         }
-        if icons::button(ui, Icon::ChevronDown, "Diferencia siguiente (F7)").clicked() {
+        if icons::button(ui, Icon::ChevronDown, i18n::t(lang, "下一处差异 (F7)", "Next diff (F7)")).clicked() {
             v.step(true);
         }
         if d.is_identical() {
-            ui.label(RichText::new("Sin diferencias").color(ui.visuals().hyperlink_color));
+            ui.label(RichText::new(i18n::t(lang, "无差异", "No differences")).color(ui.visuals().hyperlink_color));
         } else {
             ui.label(v.position_label());
-            ui.label(RichText::new(format!("+{} −{} ~{} líneas", d.added, d.removed, d.modified)).weak())
-                .on_hover_text("Añadidas, eliminadas y modificadas");
+            ui.label(RichText::new(format!("+{} −{} ~{} {}", d.added, d.removed, d.modified, i18n::t(lang, "行", "lines"))).weak())
+                .on_hover_text(i18n::t(lang, "新增、删除与修改", "Added, removed and modified"));
         }
     }
 }
@@ -1874,22 +2012,26 @@ fn diff_body(
 ) -> bool {
     if d.approximate {
         ui.label(
-            RichText::new("Documentos muy distintos: la alineación de líneas es aproximada.")
+            RichText::new(i18n::t(set.lang, "文档差异很大：行对齐为近似结果。", "Documents differ a lot: line alignment is approximate."))
                 .color(ui.visuals().warn_fg_color),
         );
     }
     if set.diff_show_list && !d.changes.is_empty() {
-        egui::Panel::right("diff_changes").default_size(320.0).show(ui, |ui| diff::changes_list(ui, d, v));
+        egui::Panel::right("diff_changes").default_size(320.0).show(ui, |ui| {
+            diff::changes_list(ui, d, v, set.lang)
+        });
     }
-    diff::show(ui, d, v, titles, set.diff_only_changes, pal, query);
+    diff::show(ui, d, v, titles, set.diff_only_changes, pal, query, set.lang);
     std::mem::take(&mut v.want_all)
 }
 
-const VIEWS: [(View, Icon, &str, &str); 3] = [
-    (View::Tree, Icon::ListTree, "Árbol", "Ctrl+1"),
-    (View::Text, Icon::FileJson, "Texto formateado", "Ctrl+2"),
-    (View::Source, Icon::SquarePen, "Fuente: editar el texto original", "Ctrl+3"),
-];
+fn views(lang: Lang) -> [(View, Icon, &'static str, &'static str); 3] {
+    [
+        (View::Tree, Icon::ListTree, i18n::t(lang, "树形", "Tree"), "Ctrl+1"),
+        (View::Text, Icon::FileJson, i18n::t(lang, "格式化文本", "Formatted text"), "Ctrl+2"),
+        (View::Source, Icon::SquarePen, i18n::t(lang, "源码：编辑原文", "Source: edit original text"), "Ctrl+3"),
+    ]
+}
 
 /// Separador vertical con un poco de aire a los lados.
 fn toolbar_sep(ui: &mut Ui) {
@@ -1949,7 +2091,7 @@ fn paint_tab_bg(ui: &Ui, rect: Rect, active: bool, hovered: bool) {
 
 /// Dibuja una pestaña. Devuelve su rectángulo, la acción pedida y si se está arrastrando.
 /// `others`: pestañas con documento, para el submenú «Comparar con…».
-fn tab_widget(ui: &mut Ui, t: &DocTab, active: bool, others: &[(u64, String)]) -> (Rect, Option<TabAction>, bool) {
+fn tab_widget(ui: &mut Ui, t: &DocTab, active: bool, others: &[(u64, String)], lang: Lang) -> (Rect, Option<TabAction>, bool) {
     let font = TextStyle::Button.resolve(ui.style());
     let mut label = match &t.mode {
         Mode::Table(_) => icons::text(Icon::Table, &t.title),
@@ -2002,20 +2144,21 @@ fn tab_widget(ui: &mut Ui, t: &DocTab, active: bool, others: &[(u64, String)]) -
         p.circle_filled(c, 3.5, color);
     }
 
-    let rename_tip = "Doble clic o F2 para cambiar el nombre";
+    let rename_tip = i18n::t(lang, "双击或按 F2 重命名", "Double-click or F2 to rename");
     let hover = match (&t.mode, &t.path) {
         (Mode::Compare(c), _) => format!(
-            "Comparación (copia de cada lado al momento de compararlos)\n{}\n{}",
+            "{}\n{}\n{}",
+            i18n::t(lang, "比较（两侧均为比较时的快照）", "Comparison (snapshots from when it was opened)"),
             icons::text(Icon::ArrowLeft, &c.labels.0),
             icons::text(Icon::ArrowRight, &c.labels.1)
         ),
         (Mode::Table(_), _) => {
-            format!("Tabla de elementos de {}\n{rename_tip}", t.origin.as_deref().unwrap_or("otra pestaña"))
+            format!("{} {}\n{rename_tip}", i18n::t(lang, "来自", "Items from"), t.origin.as_deref().unwrap_or(i18n::t(lang, "其他标签", "another tab")))
         }
         (Mode::Doc, Some(p)) => format!("{}\n{rename_tip}", p.display()),
-        (Mode::Doc, None) => format!("Sin archivo\n{rename_tip}"),
+        (Mode::Doc, None) => format!("{}\n{rename_tip}", i18n::t(lang, "未关联文件", "No file")),
     };
-    let close = close.on_hover_text("Cerrar (Ctrl+W)");
+    let close = close.on_hover_text(i18n::t(lang, "关闭 (Ctrl+W)", "Close (Ctrl+W)"));
     let resp = resp.on_hover_text(hover);
     let mut act = None;
     if close.clicked() || resp.middle_clicked() {
@@ -2030,15 +2173,15 @@ fn tab_widget(ui: &mut Ui, t: &DocTab, active: bool, others: &[(u64, String)]) -
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     }
     resp.context_menu(|ui| {
-        if ui.add(egui::Button::new("Cambiar nombre…").shortcut_text("F2")).clicked() {
+        if ui.add(egui::Button::new(i18n::t(lang, "重命名…", "Rename…")).shortcut_text("F2")).clicked() {
             act = Some(TabAction::Rename);
         }
-        if t.path.is_some() && ui.button("Copiar ruta del archivo").clicked() {
+        if t.path.is_some() && ui.button(i18n::t(lang, "复制文件路径", "Copy file path")).clicked() {
             act = Some(TabAction::CopyPath);
         }
         if t.loaded.is_some() {
             ui.separator();
-            ui.menu_button(icons::text(Icon::GitCompare, "Comparar con…"), |ui| {
+            ui.menu_button(icons::text(Icon::GitCompare, i18n::t(lang, "与…比较", "Compare with…")), |ui| {
                 let mut any = false;
                 for (uid, title) in others.iter().filter(|(uid, _)| *uid != t.uid) {
                     any = true;
@@ -2048,20 +2191,20 @@ fn tab_widget(ui: &mut Ui, t: &DocTab, active: bool, others: &[(u64, String)]) -
                     }
                 }
                 if !any {
-                    ui.add_enabled(false, egui::Button::new("(no hay otras pestañas con JSON)"));
+                    ui.add_enabled(false, egui::Button::new(i18n::t(lang, "（没有其他含 JSON 的标签）", "(no other tabs with JSON)")));
                 }
                 ui.separator();
-                if ui.button(icons::text(Icon::FolderOpen, "Otro archivo…")).clicked() {
+                if ui.button(icons::text(Icon::FolderOpen, i18n::t(lang, "其他文件…", "Other file…"))).clicked() {
                     act = Some(TabAction::CompareWithFile);
                     ui.close();
                 }
             });
         }
         ui.separator();
-        if ui.add(egui::Button::new("Cerrar").shortcut_text("Ctrl+W")).clicked() {
+        if ui.add(egui::Button::new(i18n::t(lang, "关闭", "Close")).shortcut_text("Ctrl+W")).clicked() {
             act = Some(TabAction::Close);
         }
-        if ui.button("Cerrar las demás").clicked() {
+        if ui.button(i18n::t(lang, "关闭其他", "Close others")).clicked() {
             act = Some(TabAction::CloseOthers);
         }
     });
@@ -2110,26 +2253,27 @@ enum Welcome {
 }
 
 /// Pantalla inicial. Devuelve el botón pulsado.
-fn welcome(ui: &mut Ui) -> Option<Welcome> {
+fn welcome(ui: &mut Ui, lang: Lang) -> Option<Welcome> {
+    let t = |zh, en| i18n::t(lang, zh, en);
     let mut open = None;
     ui.vertical_centered(|ui| {
         ui.add_space(ui.available_height() * 0.3);
-        ui.heading("Visor JSON");
+        ui.heading(t("JSON 查看器", "JSON Viewer"));
         ui.add_space(8.0);
-        ui.label("Abre un archivo (Ctrl+O), arrástralo aquí o pega un JSON (Ctrl+V).");
-        ui.label(RichText::new("Se aceptan comentarios // y /* */ y comas finales.").weak());
+        ui.label(t("打开文件 (Ctrl+O)、拖到此处，或粘贴 JSON (Ctrl+V)。", "Open a file (Ctrl+O), drop it here, or paste JSON (Ctrl+V)."));
+        ui.label(RichText::new(t("支持 // 与 /* */ 注释以及尾随逗号。", "Comments // and /* */ and trailing commas are accepted.")).weak());
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             let w = 450.0;
             ui.add_space((ui.available_width() - w).max(0.0) / 2.0);
-            if ui.button(icons::text(Icon::FolderOpen, "Abrir archivo…")).on_hover_text("Ctrl+O").clicked() {
+            if ui.button(icons::text(Icon::FolderOpen, t("打开文件…", "Open file…"))).on_hover_text("Ctrl+O").clicked() {
                 open = Some(Welcome::Open);
             }
-            if ui.button(icons::text(Icon::ClipboardPaste, "Pegar del portapapeles")).on_hover_text("Ctrl+V").clicked()
+            if ui.button(icons::text(Icon::ClipboardPaste, t("从剪贴板粘贴", "Paste from clipboard"))).on_hover_text("Ctrl+V").clicked()
             {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
-            if ui.button(icons::text(Icon::Database, "Importar tabla de SQL Server…")).on_hover_text("Ctrl+I").clicked()
+            if ui.button(icons::text(Icon::Database, t("导入 SQL Server 表…", "Import SQL Server table…"))).on_hover_text("Ctrl+I").clicked()
             {
                 open = Some(Welcome::Import);
             }
@@ -2230,36 +2374,107 @@ fn find_in_source(ctx: &egui::Context, tab: &mut DocTab, q: &str, forward: bool)
     true
 }
 
-fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-    let candidates: [(&str, &str, FontFamily, bool); 2] = [
-        ("consolas", "consola.ttf", FontFamily::Monospace, true),
-        ("segoeui", "segoeui.ttf", FontFamily::Proportional, true),
+pub(crate) fn startup_log(msg: &str) {
+    use std::io::Write;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let t0 = START.get_or_init(Instant::now);
+    let path = std::env::temp_dir().join("jsonviewer-startup.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{:7.1} ms  {msg}", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+pub(crate) fn startup_log_pub(msg: &str) {
+    startup_log(msg);
+}
+
+/// 仅挂上 Lucide（静态嵌入），不碰系统字体、不 set_fonts。
+fn install_lucide(ctx: &egui::Context) {
+    // 图标用私有区码点；Lowest 即可，不影响正文优先字体。
+    let families = vec![
+        InsertFontFamily { family: FontFamily::Proportional, priority: FontPriority::Lowest },
+        InsertFontFamily { family: FontFamily::Monospace, priority: FontPriority::Lowest },
     ];
-    for (name, file, family, first) in candidates {
-        let path = PathBuf::from(&windir).join("Fonts").join(file);
-        if let Ok(bytes) = std::fs::read(&path) {
-            fonts.font_data.insert(name.into(), Arc::new(FontData::from_owned(bytes)));
-            let list = fonts.families.entry(family).or_default();
-            if first {
-                list.insert(0, name.into());
-            } else {
-                list.push(name.into());
-            }
+    ctx.add_font(FontInsert::new(
+        "lucide",
+        FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES),
+        families,
+    ));
+}
+
+fn install_font_inserts(ctx: &egui::Context, fonts: Vec<FontInsert>) {
+    startup_log(&format!("install {} system fonts", fonts.len()));
+    for font in fonts {
+        ctx.add_font(font);
+    }
+}
+
+/// 后台读取 Consolas / Segoe UI / 中文字体（在 main 中与 GL 并行启动）。
+pub(crate) fn spawn_system_font_loader() -> std::sync::mpsc::Receiver<Vec<FontInsert>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let fonts = load_system_fonts();
+        let _ = tx.send(fonts);
+    });
+    rx
+}
+
+fn load_system_fonts() -> Vec<FontInsert> {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+    let dir = PathBuf::from(windir).join("Fonts");
+    let mut out = Vec::new();
+
+    // 拉丁：优先作为正文/等宽主字体。
+    let latin: [(&str, &str, FontFamily); 2] = [
+        ("segoeui", "segoeui.ttf", FontFamily::Proportional),
+        ("consolas", "consola.ttf", FontFamily::Monospace),
+    ];
+    for (name, file, family) in latin {
+        if let Ok(bytes) = std::fs::read(dir.join(file)) {
+            out.push(FontInsert::new(
+                name,
+                FontData::from_owned(bytes),
+                vec![InsertFontFamily { family, priority: FontPriority::Highest }],
+            ));
         }
     }
-    // Segoe UI como respaldo de la monoespaciada (acentos, símbolos).
-    if fonts.font_data.contains_key("segoeui") {
-        fonts.families.entry(FontFamily::Monospace).or_default().push("segoeui".into());
+
+    // 中文：作为回退（一份即可）。
+    let cjk: [(&str, &str, u32); 5] = [
+        ("msyh", "msyh.ttc", 0),
+        ("simhei", "simhei.ttf", 0),
+        ("deng", "Deng.ttf", 0),
+        ("msyh", "msyhbd.ttc", 0),
+        ("simsun", "simsun.ttc", 0),
+    ];
+    for (name, file, index) in cjk {
+        if let Ok(bytes) = std::fs::read(dir.join(file)) {
+            let mut data = FontData::from_owned(bytes);
+            data.index = index;
+            out.push(FontInsert::new(
+                name,
+                data,
+                vec![
+                    InsertFontFamily { family: FontFamily::Proportional, priority: FontPriority::Lowest },
+                    InsertFontFamily { family: FontFamily::Monospace, priority: FontPriority::Lowest },
+                ],
+            ));
+            break;
+        }
     }
-    icons::install(&mut fonts);
-    ctx.set_fonts(fonts);
+    out
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.boot_step(&ctx);
+        self.poll_fonts(&ctx);
+        // 字体线程无 ctx，未就绪时主动催帧。
+        if self.font_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        self.sync_title(&ctx);
         self.apply_style(&ctx);
         self.handle_input(&ctx);
         self.poll_updates();
@@ -2284,7 +2499,9 @@ impl eframe::App for App {
 
         self.import_window(&ctx);
         if self.show_help {
-            egui::Window::new("Atajos de teclado").open(&mut self.show_help).resizable(false).show(&ctx, help_ui);
+            let title = self.t("键盘快捷键", "Keyboard shortcuts");
+            let lang = self.set.lang;
+            egui::Window::new(title).open(&mut self.show_help).resizable(false).show(&ctx, |ui| help_ui(ui, lang));
         }
 
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
@@ -2295,7 +2512,7 @@ impl eframe::App for App {
             p.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Suelta para abrir",
+                self.t("松开以打开", "Drop to open"),
                 FontId::proportional(28.0),
                 Color32::WHITE,
             );
@@ -2310,42 +2527,43 @@ impl eframe::App for App {
     }
 }
 
-fn help_ui(ui: &mut Ui) {
+fn help_ui(ui: &mut Ui, lang: Lang) {
+    let t = |zh, en| i18n::t(lang, zh, en);
     egui::Grid::new("help").num_columns(2).striped(true).show(ui, |ui| {
         for (k, d) in [
-            ("Ctrl+O", "Abrir archivo(s)"),
-            ("Ctrl+V", "Pegar JSON como documento nuevo"),
-            ("Ctrl+N", "Documento nuevo para escribir"),
-            ("Ctrl+I", "Importar tabla de SQL Server (Copy with Headers)"),
-            ("Ctrl+W / clic medio", "Cerrar pestaña"),
-            ("Ctrl+Tab", "Siguiente pestaña"),
-            ("F2 / doble clic en pestaña", "Cambiar el nombre de la pestaña (se usa al guardar)"),
-            ("F5", "Recargar archivo"),
-            ("Ctrl+1 … 3", "Árbol / Texto / Fuente"),
-            ("F7, Mayús+F7", "Comparación: diferencia siguiente / anterior"),
-            ("Ctrl+F, F3, Mayús+F3", "Buscar, siguiente, anterior"),
-            ("Ctrl+Enter", "Aplicar cambios de la fuente"),
+            ("Ctrl+O", t("打开文件", "Open file(s)")),
+            ("Ctrl+V", t("粘贴 JSON 为新文档", "Paste JSON as a new document")),
+            ("Ctrl+N", t("新建空白文档", "New blank document")),
+            ("Ctrl+I", t("导入 SQL Server 表（Copy with Headers）", "Import SQL Server table (Copy with Headers)")),
+            ("Ctrl+W / 中键", t("关闭标签页", "Close tab")),
+            ("Ctrl+Tab", t("下一个标签页", "Next tab")),
+            ("F2 / 双击标签", t("重命名标签（保存时使用）", "Rename tab (used when saving)")),
+            ("F5", t("重新加载文件", "Reload file")),
+            ("Ctrl+1 … 3", t("树 / 文本 / 源码", "Tree / Text / Source")),
+            ("F7, Shift+F7", t("比较：下一处 / 上一处差异", "Diff: next / previous change")),
+            ("Ctrl+F, F3, Shift+F3", t("查找、下一个、上一个", "Find, next, previous")),
+            ("Ctrl+Enter", t("应用源码更改", "Apply source changes")),
             ("", ""),
-            ("↑ ↓ RePág AvPág Inicio Fin", "Moverse (árbol y tabla)"),
-            ("← →", "Cerrar / expandir, ir al padre / primer hijo"),
-            ("Enter, Espacio, doble clic", "Expandir/cerrar"),
-            ("Ctrl+clic, Mayús+clic", "Seleccionar varios elementos (para verlos como tabla)"),
-            ("C", "Compactar nodo en una línea"),
-            ("H", "Compactar hijos (cada hijo en una línea)"),
-            ("X", "Cerrar hijos"),
-            ("E", "Expandir todo el subárbol"),
-            ("A", "Auto-compactar el subárbol"),
-            ("G", "Ver el arreglo (o los elementos seleccionados) como tabla"),
-            ("Ctrl+C", "Copiar el valor seleccionado"),
-            ("Ctrl+clic en ▶", "Compactar"),
-            ("Alt+clic en ▶", "Compactar hijos"),
-            ("Mayús+clic en ▶", "Expandir todo el subárbol"),
-            ("Clic derecho", "Más opciones: copiar ruta, ver como tabla, filtrar por clave…"),
+            ("↑ ↓ PgUp PgDn Home End", t("在树和表中移动", "Move (tree and table)")),
+            ("← →", t("折叠 / 展开，到父节点 / 第一个子节点", "Collapse / expand, parent / first child")),
+            ("Enter, Space, 双击", t("展开 / 折叠", "Expand / collapse")),
+            ("Ctrl+单击, Shift+单击", t("多选元素（用于表格视图）", "Multi-select items (for table view)")),
+            ("C", t("将节点压缩为一行", "Compact node into one line")),
+            ("H", t("压缩子节点（每个一行）", "Compact children (one line each)")),
+            ("X", t("折叠子节点", "Close children")),
+            ("E", t("展开整个子树", "Expand entire subtree")),
+            ("A", t("自动压缩子树", "Auto-compact subtree")),
+            ("G", t("将数组（或所选元素）显示为表格", "View array (or selected items) as table")),
+            ("Ctrl+C", t("复制所选值", "Copy selected value")),
+            ("Ctrl+单击 ▶", t("压缩", "Compact")),
+            ("Alt+单击 ▶", t("压缩子节点", "Compact children")),
+            ("Shift+单击 ▶", t("展开整个子树", "Expand entire subtree")),
+            ("右键", t("更多选项：复制路径、表格视图、按键过滤…", "More: copy path, table view, filter by key…")),
             (
-                "Clic derecho → Seleccionar para comparar",
-                "Marca un elemento; en otro, «Comparar con…» abre el diff en una pestaña",
+                t("右键 → 选择以便比较", "Right-click → Select for compare"),
+                t("标记一个元素；在另一个上「与…比较」打开差异标签", "Mark one item; on another, “Compare with…” opens a diff tab"),
             ),
-            ("Clic derecho en pestaña → Comparar con…", "Compara dos documentos completos"),
+            (t("右键标签 → 与…比较", "Right-click tab → Compare with…"), t("比较两个完整文档", "Compare two full documents")),
         ] {
             ui.label(RichText::new(k).monospace());
             ui.label(d);

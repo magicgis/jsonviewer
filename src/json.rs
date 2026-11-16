@@ -9,6 +9,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use crate::i18n::{self, Lang};
+
 pub type NodeId = u32;
 pub const NONE: NodeId = u32::MAX;
 
@@ -317,13 +319,22 @@ pub struct ParseError {
     pub char_offset: usize,
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} (línea {}, columna {})", self.msg, self.line, self.col)
+impl ParseError {
+    pub fn display(&self, lang: Lang) -> String {
+        match lang {
+            Lang::Zh => format!("{}（第 {} 行，第 {} 列）", self.msg, self.line, self.col),
+            Lang::En => format!("{} (line {}, column {})", self.msg, self.line, self.col),
+        }
     }
 }
 
-/// Convierte bytes leídos de un archivo a texto (UTF-8 o UTF-16 con BOM).
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display(Lang::Zh))
+    }
+}
+
+/// 将文件字节解码为文本：UTF-8 / UTF-16（BOM）/ GB18030（含 GBK）。
 pub fn decode_bytes(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
         let le = bytes[0] == 0xFF;
@@ -334,12 +345,25 @@ pub fn decode_bytes(bytes: &[u8]) -> String {
         return String::from_utf16_lossy(&units);
     }
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_owned();
+    }
+    // Windows 中文环境常见：无 BOM 的 GBK / GB18030。
+    let (decoded, _, had_errors) = encoding_rs::GB18030.decode(bytes);
+    if !had_errors {
+        return decoded.into_owned();
+    }
     String::from_utf8_lossy(bytes).into_owned()
 }
 
 pub fn parse(src: &str) -> Result<Doc, ParseError> {
+    parse_with(src, Lang::Zh)
+}
+
+pub fn parse_with(src: &str, lang: Lang) -> Result<Doc, ParseError> {
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let mut p = Parser {
+        lang,
         src,
         s: src.as_bytes(),
         pos: 0,
@@ -367,6 +391,7 @@ pub fn parse(src: &str) -> Result<Doc, ParseError> {
 }
 
 struct Parser<'a> {
+    lang: Lang,
     src: &'a str,
     s: &'a [u8],
     pos: usize,
@@ -377,6 +402,12 @@ struct Parser<'a> {
     strs: String,
     /// Byte donde empieza cada nodo (para calcular su línea).
     starts: Vec<usize>,
+}
+
+impl Parser<'_> {
+    fn t(&self, zh: &'static str, en: &'static str) -> &'static str {
+        i18n::t(self.lang, zh, en)
+    }
 }
 
 type PResult<T> = Result<T, ParseError>;
@@ -420,7 +451,7 @@ impl<'a> Parser<'a> {
                         let start = self.pos;
                         match self.src[self.pos + 2..].find("*/") {
                             Some(i) => self.pos += 2 + i + 2,
-                            None => return self.err_at(start, "Comentario /* sin cerrar"),
+                            None => return self.err_at(start, self.t("未闭合的 /* 注释", "Unclosed /* comment")),
                         }
                     }
                     _ => return Ok(()),
@@ -434,7 +465,7 @@ impl<'a> Parser<'a> {
     fn run(&mut self) -> PResult<()> {
         self.ws()?;
         if self.peek().is_none() {
-            return self.err("El documento está vacío");
+            return self.err(self.t("文档为空", "Document is empty"));
         }
         self.value(NO_KEY, NONE)?;
         while let Some(&top) = self.stack.last() {
@@ -442,7 +473,13 @@ impl<'a> Parser<'a> {
             let is_obj = self.nodes[top as usize].kind == Kind::Object;
             let close = if is_obj { b'}' } else { b']' };
             match self.peek() {
-                None => return self.err(format!("Fin inesperado: falta '{}'", close as char)),
+                None => {
+                    return self.err(format!(
+                        "{} '{}'",
+                        self.t("意外结束：缺少", "Unexpected end: missing"),
+                        close as char
+                    ));
+                }
                 Some(c) if c == close => {
                     self.pos += 1;
                     self.stack.pop();
@@ -452,12 +489,17 @@ impl<'a> Parser<'a> {
             }
             if !self.nodes[top as usize].children.is_empty() {
                 if self.peek() != Some(b',') {
-                    return self.err(format!("Se esperaba ',' o '{}'", close as char));
+                    return self.err(format!(
+                        "{} ',' {} '{}'",
+                        self.t("期望", "Expected"),
+                        self.t("或", "or"),
+                        close as char
+                    ));
                 }
                 self.pos += 1;
                 self.ws()?;
                 if self.peek() == Some(close) {
-                    // coma final
+                    // trailing comma
                     self.pos += 1;
                     self.stack.pop();
                     continue;
@@ -465,12 +507,12 @@ impl<'a> Parser<'a> {
             }
             let key = if is_obj {
                 if self.peek() != Some(b'"') {
-                    return self.err("Se esperaba una clave entre comillas");
+                    return self.err(self.t("期望带引号的键名", "Expected a quoted key"));
                 }
                 let k = self.string()?;
                 self.ws()?;
                 if self.peek() != Some(b':') {
-                    return self.err("Se esperaba ':'");
+                    return self.err(self.t("期望 ':'", "Expected ':'"));
                 }
                 self.pos += 1;
                 self.ws()?;
@@ -482,7 +524,7 @@ impl<'a> Parser<'a> {
         }
         self.ws()?;
         if self.pos < self.s.len() {
-            return self.err("Contenido extra después del final del JSON");
+            return self.err(self.t("JSON 结束后仍有多余内容", "Trailing content after JSON"));
         }
         Ok(())
     }
@@ -508,7 +550,7 @@ impl<'a> Parser<'a> {
     fn value(&mut self, key: KeyId, parent: NodeId) -> PResult<()> {
         let start = self.pos;
         let (kind, text) = match self.peek() {
-            None => return self.err("Se esperaba un valor"),
+            None => return self.err(self.t("期望一个值", "Expected a value")),
             Some(b'{') => {
                 self.pos += 1;
                 (Kind::Object, (0, 0))
@@ -525,7 +567,7 @@ impl<'a> Parser<'a> {
             Some(b'f') => (Kind::Bool, self.literal("false")?),
             Some(b'n') => (Kind::Null, self.literal("null")?),
             Some(b'-' | b'0'..=b'9') => (Kind::Num, self.number()?),
-            Some(_) => return self.err("Valor inesperado"),
+            Some(_) => return self.err(self.t("意外的值", "Unexpected value")),
         };
         let id = self.nodes.len() as NodeId;
         let (depth, index) = if parent == NONE {
@@ -548,7 +590,7 @@ impl<'a> Parser<'a> {
             self.pos += word.len();
             Ok(self.store(word))
         } else {
-            self.err("Valor inesperado")
+            self.err(self.t("意外的值", "Unexpected value"))
         }
     }
 
@@ -562,7 +604,7 @@ impl<'a> Parser<'a> {
         }
         let raw = &self.src[start..self.pos];
         if !raw.bytes().any(|b| b.is_ascii_digit()) {
-            return self.err_at(start, "Número inválido");
+            return self.err_at(start, self.t("无效数字", "Invalid number"));
         }
         Ok(self.store(raw))
     }
@@ -572,10 +614,11 @@ impl<'a> Parser<'a> {
         let open = self.pos;
         self.pos += 1;
         let start = self.pos;
+        let unclosed = self.t("未闭合的字符串", "Unterminated string");
         // Camino rápido: sin escapes.
         loop {
             match self.peek() {
-                None | Some(b'\n') => return self.err_at(open, "Cadena sin cerrar"),
+                None | Some(b'\n') => return self.err_at(open, unclosed),
                 Some(b'"') => {
                     let s = &self.src[start..self.pos];
                     self.pos += 1;
@@ -589,7 +632,7 @@ impl<'a> Parser<'a> {
         let mut run = self.pos;
         loop {
             match self.peek() {
-                None | Some(b'\n') => return self.err_at(open, "Cadena sin cerrar"),
+                None | Some(b'\n') => return self.err_at(open, unclosed),
                 Some(b'"') => {
                     out.push_str(&self.src[run..self.pos]);
                     self.pos += 1;
@@ -599,7 +642,7 @@ impl<'a> Parser<'a> {
                     out.push_str(&self.src[run..self.pos]);
                     let esc_pos = self.pos;
                     self.pos += 1;
-                    let Some(e) = self.peek() else { return self.err_at(open, "Cadena sin cerrar") };
+                    let Some(e) = self.peek() else { return self.err_at(open, unclosed) };
                     self.pos += 1;
                     match e {
                         b'"' => out.push('"'),
@@ -627,7 +670,9 @@ impl<'a> Parser<'a> {
                             };
                             out.push(c.unwrap_or('\u{FFFD}'));
                         }
-                        _ => return self.err_at(esc_pos, "Secuencia de escape inválida"),
+                        _ => {
+                            return self.err_at(esc_pos, self.t("无效的转义序列", "Invalid escape sequence"));
+                        }
                     }
                     run = self.pos;
                 }
@@ -638,10 +683,10 @@ impl<'a> Parser<'a> {
 
     fn hex4(&mut self, esc_pos: usize) -> PResult<u32> {
         let Some(h) = self.s.get(self.pos..self.pos + 4) else {
-            return self.err_at(esc_pos, "Escape \\u incompleto");
+            return self.err_at(esc_pos, self.t("不完整的 \\u 转义", "Incomplete \\u escape"));
         };
         let Ok(v) = u32::from_str_radix(std::str::from_utf8(h).unwrap_or("x"), 16) else {
-            return self.err_at(esc_pos, "Escape \\u inválido");
+            return self.err_at(esc_pos, self.t("无效的 \\u 转义", "Invalid \\u escape"));
         };
         self.pos += 4;
         Ok(v)
@@ -921,6 +966,15 @@ mod tests {
     fn reports_error_position() {
         let e = parse("{\n  \"a\": 1\n  \"b\": 2\n}").err().unwrap();
         assert_eq!((e.line, e.col), (3, 3));
+    }
+
+    #[test]
+    fn decode_utf8_and_gbk_chinese() {
+        let utf8 = "{\"名\":\"中文\"}".as_bytes();
+        assert_eq!(decode_bytes(utf8), "{\"名\":\"中文\"}");
+        // 「中文」的 GBK 编码：D6 D0 CE C4
+        let gbk = b"{\"name\":\"\xD6\xD0\xCE\xC4\"}";
+        assert_eq!(decode_bytes(gbk), "{\"name\":\"中文\"}");
     }
 
     #[test]

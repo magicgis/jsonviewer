@@ -99,7 +99,7 @@ pub fn show(ui: &mut Ui, st: &mut TextState, set: &crate::settings::Settings, pa
             let mut s = JobSink::new(pal, font.clone(), query);
             json::lex_line(line, |r, tok| json::Sink::push(&mut s, &line[r], tok));
             if cut {
-                s.colored(&format!(" … ({} caracteres más)", lines[li].1 - b), pal.faint);
+                s.colored(&format!(" … (+{} chars)", lines[li].1 - b), pal.faint);
             }
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(num_w, row_h), Sense::hover());
