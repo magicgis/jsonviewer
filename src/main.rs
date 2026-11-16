@@ -29,7 +29,7 @@ fn main() -> eframe::Result {
     let files: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
     app::startup_log_pub("args parsed");
 
-    // 不在启动时解码大图标；app_id 用 ASCII，避免漫游目录乱码。
+    // 窗口标题栏图标用 32×32（轻量）；exe 图标仍由 build.rs 嵌入 icon.ico。
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_app_id("jsonviewer")
@@ -37,7 +37,10 @@ fn main() -> eframe::Result {
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([480.0, 320.0])
             .with_drag_and_drop(true)
-            .with_icon(eframe::egui::IconData::default()),
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-32.png"))
+                    .expect("icon-32.png must be valid PNG"),
+            ),
         persist_window: true,
         ..Default::default()
     };
